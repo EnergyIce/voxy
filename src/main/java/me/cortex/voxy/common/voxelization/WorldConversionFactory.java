@@ -291,7 +291,9 @@ public class WorldConversionFactory {
                 if (nbt != null) {
                     try {
                         int instanceIndex = instanceKeyRegistry.getOrCreateIndex(state, nbt);
-                        voxel = Mapper.withInstanceOverride(voxel, instanceIndex);
+                        if (instanceIndex >= 0) {
+                            voxel = Mapper.withInstanceOverride(voxel, instanceIndex);
+                        }
                     } catch (Exception e) {
                         //Fall back to the plain per-BlockState appearance for this voxel
                     }

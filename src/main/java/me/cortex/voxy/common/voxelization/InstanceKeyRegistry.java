@@ -50,7 +50,12 @@ public class InstanceKeyRegistry {
 
     //Returns the stable index for this key, registering it if it's new. Thread-safe, callable
     //from ingest worker threads.
+    //Returns -1 when the block entity data doesn't change the block's appearance, so the normal per-BlockState
+    // model is correct and no instance is needed.
     public int getOrCreateIndex(BlockState wrapperState, CompoundTag rawNbt) {
+        if (!needsInstance(rawNbt)) {
+            return -1;
+        }
         var nbt = canonicalizeNbt(rawNbt);
         var key = new Key(wrapperState, nbt);
         var existing = this.key2index.get(key);
@@ -88,8 +93,25 @@ public class InstanceKeyRegistry {
     //  - ForgeCaps: capability data attached by other mods, never part of a block model
     //  - Create Railways Navigator displays (Create copycat based): live train data and refresh timestamp; the
     //    displayed text is drawn by a block entity renderer, not by the model
+    //  - TrafficCraft: only the paint colour affects the block model. Everything else is renderer-only or live
+    //    state (traffic light phase/timers/lit lamps/links with coordinates, sign text) and is dropped.
+    //TrafficCraft blocks that were never painted (color -1 = PaintColor.NONE) look exactly like their normal model,
+    // which bakes their default colour (see ModelFactory#captureColourConstant) - no instance needed for them.
+    public static boolean needsInstance(CompoundTag nbt) {
+        if (nbt != null && nbt.getString("id").startsWith("trafficcraft:")) {
+            return nbt.contains("color") && nbt.getInt("color") != -1;
+        }
+        return true;
+    }
+
     public static CompoundTag canonicalizeNbt(CompoundTag nbt) {
         if (nbt == null) return null;
+        if (nbt.getString("id").startsWith("trafficcraft:")) {
+            CompoundTag tc = new CompoundTag();
+            tc.putString("id", nbt.getString("id"));
+            if (nbt.contains("color")) tc.put("color", nbt.get("color").copy());
+            return tc;
+        }
         CompoundTag out = nbt.copy();
         out.remove("ForgeCaps");
         if (out.getString("id").startsWith("createrailwaysnavigator:")) {

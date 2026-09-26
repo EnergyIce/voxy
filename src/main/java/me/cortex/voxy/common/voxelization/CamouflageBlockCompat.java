@@ -25,7 +25,8 @@ public class CamouflageBlockCompat {
     private static Class<?> framedBlockEntityClass;
     private static Class<?> copycatBlockClass;
     private static Class<?> copycatsPlusBlockClass;
-    private static Class<?> trafficCraftRoadBlockClass;
+    private static Class<?> trafficCraftPaintableClass;
+    private static Class<?> trafficCraftTownSignClass;
 
     private static synchronized void init() {
         if (initialized) return;
@@ -58,15 +59,21 @@ public class CamouflageBlockCompat {
             Logger.warn("Voxy: Copycats+ instance-render compat unavailable (" + e + ")");
         }
 
-        //TrafficCraft painted roads (asphalt/concrete, full blocks and slopes, one block per paint pattern).
-        // The paint colour lives in their block entity and is applied through a BlockColor tint, so the plain
-        // per-BlockState bake can only produce black markings. Unpainted asphalt/concrete is a plain block
-        // (not a RoadBlock) and stays on the normal fast path.
+        //TrafficCraft paintable blocks with a block entity: painted roads (asphalt/concrete blocks and slopes), concrete
+        // barriers, guardrails, cones, bollards, barrels, barrier fences, reflectors, traffic lights, street and house
+        // number signs, paint buckets. Their paint colour lives in the block entity and is applied through a
+        // BlockColor tint, so the plain per-BlockState bake can only produce black parts. Unpainted asphalt/concrete
+        // has no block entity and stays on the normal fast path; town signs aren't tinted and stay there too.
         try {
-            trafficCraftRoadBlockClass = Class.forName("de.mrjulsen.trafficcraft.block.data.RoadBlock");
-            Logger.info("Voxy: TrafficCraft painted road instance-render compat enabled");
+            trafficCraftPaintableClass = Class.forName("de.mrjulsen.trafficcraft.block.data.IPaintableBlock");
+            try {
+                trafficCraftTownSignClass = Class.forName("de.mrjulsen.trafficcraft.block.TownSignBlock");
+            } catch (ReflectiveOperationException e) {
+                trafficCraftTownSignClass = null;
+            }
+            Logger.info("Voxy: TrafficCraft paintable block instance-render compat enabled");
         } catch (ReflectiveOperationException e) {
-            trafficCraftRoadBlockClass = null;
+            trafficCraftPaintableClass = null;
         }
     }
 
@@ -80,7 +87,9 @@ public class CamouflageBlockCompat {
         if (copycatsPlusBlockClass != null && copycatsPlusBlockClass.isInstance(block)) {
             return true;
         }
-        if (trafficCraftRoadBlockClass != null && trafficCraftRoadBlockClass.isInstance(block)) {
+        if (trafficCraftPaintableClass != null && trafficCraftPaintableClass.isInstance(block)
+                && block instanceof net.minecraft.world.level.block.EntityBlock
+                && (trafficCraftTownSignClass == null || !trafficCraftTownSignClass.isInstance(block))) {
             return true;
         }
         if (framedBlockEntityClass != null) {

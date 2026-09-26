@@ -1052,6 +1052,19 @@ public class ModelFactory {
             }
         };
         int c = colorProvider.getColor(state, getter, BlockPos.ZERO, 0);
+        if (c == 0) {
+            //0 = "no data": handlers that read the block entity (e.g. TrafficCraft's paintable blocks) find none in
+            // this fake world and give up. Without any world (null level/pos, allowed by the BlockColor contract)
+            // they return the block's default colour instead - which is exactly the appearance of every
+            // unpainted/default instance of such a block.
+            try {
+                int fallback = colorProvider.getColor(state, null, null, 0);
+                if (fallback != 0) return fallback;
+            } catch (Exception e) {
+                //Handler doesn't support a null world, keep its original answer
+            }
+            return c;
+        }
         if (c!=-1) return c;
         return colorProvider.getColor(state, getter, BlockPos.ZERO, 1);
     }
