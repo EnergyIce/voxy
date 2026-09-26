@@ -137,11 +137,6 @@ public class SoftwareModelTextureBakery {
     }
 
     //? if forge || neoforge {
-    //Diagnostics of the last renderToOutputWithModelData(): emitted quad count and their model-space
-    // bounds (minX,minY,minZ,maxX,maxY,maxZ) - lets a log show whether a camo model produced sane geometry.
-    public int dbgQuadCount;
-    public final float[] dbgBounds = new float[6];
-
     private void bakeBlockModelWithData(BlockState state, RenderType layer, ModelData modelData) {
         if (state.getRenderShape() == RenderShape.INVISIBLE) {
             return;// Dont bake if invisible
@@ -162,15 +157,6 @@ public class SoftwareModelTextureBakery {
                 continue;
             }
             for (var quad : quads) {
-                int[] verts = quad.getVertices();
-                for (int v = 0; v < 4; v++) {
-                    for (int c = 0; c < 3; c++) {
-                        float f = Float.intBitsToFloat(verts[v * 8 + c]);
-                        this.dbgBounds[c] = Math.min(this.dbgBounds[c], f);
-                        this.dbgBounds[3 + c] = Math.max(this.dbgBounds[3 + c], f);
-                    }
-                }
-                this.dbgQuadCount++;
                 (layer == RenderType.translucent() ? this.translucentVC : this.opaqueVC)
                         .quad(quad, state.is(BlockTags.LEAVES), layer);
             }
@@ -268,9 +254,6 @@ public class SoftwareModelTextureBakery {
 
         this.opaqueVC.reset();
         this.translucentVC.reset();
-        this.dbgQuadCount = 0;
-        java.util.Arrays.fill(this.dbgBounds, 0, 3, Float.MAX_VALUE);
-        java.util.Arrays.fill(this.dbgBounds, 3, 6, -Float.MAX_VALUE);
 
         var model = Minecraft.getInstance().getModelManager().getBlockModelShaper().getBlockModel(state);
         if (blockEntity != null) {

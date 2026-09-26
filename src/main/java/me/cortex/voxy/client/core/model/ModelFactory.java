@@ -265,7 +265,7 @@ public class ModelFactory {
             // block: the brick side is solid). Judging occlusion per face instead of by the model's layer lets
             // such a face cull the opposing coplanar face of its neighbour, instead of both being drawn on the
             // same plane and z-fighting.
-            occludesFace &= layer != RenderType.translucent() || (me.cortex.voxy.common.voxelization.CamoDebug.FACE_OCCLUSION && TextureUtils.isSolidWhereDrawn(textureData[face]));
+            occludesFace &= layer != RenderType.translucent() || TextureUtils.isSolidWhereDrawn(textureData[face]);
             occludesFace &= offset < 0.1;
             if (occludesFace) {
                 occludesFace &= ((float)writeCount)/(MODEL_TEXTURE_SIZE * MODEL_TEXTURE_SIZE) > 0.9;
@@ -314,7 +314,7 @@ public class ModelFactory {
         modelFlags |= isShaded?8:0;
         //Single sided (see block_model.glsl): the quads of a camouflage instance are outer-face views and must
         // not be visible from behind. Plant-like (double sided) models keep both sides.
-        modelFlags |= (needsDoubleSidedQuads || !me.cortex.voxy.common.voxelization.CamoDebug.SINGLE_SIDED)?0:16;
+        modelFlags |= needsDoubleSidedQuads?0:16;
         MemoryUtil.memPutInt(uploadPtr, modelFlags); uploadPtr += 4;
 
         //No colour provider -> nothing to sample, tell the GPU to skip it

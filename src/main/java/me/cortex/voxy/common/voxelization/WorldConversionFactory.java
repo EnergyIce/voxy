@@ -229,7 +229,6 @@ public class WorldConversionFactory {
     // report true since walking the entire global block state registry per section would be far too
     // expensive - those are rare (very block-diverse sections) so this is an acceptable tradeoff.
     public static boolean sectionMayContainCompatBlocks(PalettedContainer<BlockState> blockContainer) {
-        if (!CamoDebug.ENABLED) return false;
         var vp = blockContainer.data.palette();
         if (vp instanceof GlobalPalette<BlockState>) {
             return true;
@@ -289,7 +288,6 @@ public class WorldConversionFactory {
 
             if (bId != 0 && CamouflageBlockCompat.mightNeedResolve(state.getBlock())) {
                 var nbt = blockEntityNbt == null ? null : blockEntityNbt.get(sectionOrigin.offset(x, y, z));
-                CamoStats.count(String.valueOf(net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(state.getBlock())), nbt != null ? "ingest.withBE" : "ingest.noBE");
                 if (nbt != null) {
                     try {
                         int instanceIndex = instanceKeyRegistry.getOrCreateIndex(state, nbt);

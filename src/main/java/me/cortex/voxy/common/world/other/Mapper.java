@@ -114,7 +114,7 @@ public class Mapper {
     private static final long INSTANCE_INDEX_MASK = (1L<<26)-1;
 
     public static boolean hasInstanceOverride(long id) {
-        return me.cortex.voxy.common.voxelization.CamoDebug.ENABLED && (id & INSTANCE_FLAG_BIT) != 0;
+        return (id & INSTANCE_FLAG_BIT) != 0;
     }
 
     public static int getInstanceIndex(long id) {

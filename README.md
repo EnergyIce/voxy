@@ -15,24 +15,7 @@ The mod ID is unchanged (`voxy`), so existing Voxy configs and LoD data keep wor
 ## What's different in this rework
 
 - **Camouflage blocks in the LoD:** Framed Blocks, Create Copycats and Copycats+ are rendered with their real material instead of the empty frame / bare copycat. Stairs, slopes, bytes, layers and mixed glass/solid blocks are approximated as closely as Voxy's model format allows.
-- **No more freeze on disconnect:** leaving a server, or being kicked by a server restart, no longer hangs the game.
 - **Distant Horizons import** supports DH's newer `DataFormatVersion 2` databases (`/voxy import distant_horizons`).
-
-### Camouflage debug switches
-
-On first launch the file `config/voxy_camo_debug.properties` is created. All switches default to the shipped behaviour; you only need it to track down rendering problems.
-
-| Key | Default | Meaning |
-|-----|---------|---------|
-| `enabled` | `true` | Master switch for camouflage block support |
-| `multiPlane` | `true` | Split stepped/sloped blocks into several depth planes |
-| `mixedLayers` | `true` | Keep glass and solid parts of one block as separate layers |
-| `singleSided` | `true` | Hide the back faces of camouflage models |
-| `twoSided` | `true` | Two-sided rasterisation while baking |
-| `faceOcclusion` | `true` | Per-face occlusion for translucent camouflage models |
-| `diagnostics` | `false` | Log statistics and dump baked textures to `voxy_camo_dump/` |
-
-Restart the game after editing the file.
 
 ## Building from source
 

@@ -4,8 +4,6 @@ import it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap;
 import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
 import me.cortex.voxy.client.core.model.bakery.SoftwareModelTextureBakery;
 import me.cortex.voxy.common.Logger;
-import me.cortex.voxy.common.voxelization.CamoDebug;
-import me.cortex.voxy.common.voxelization.CamoStats;
 import me.cortex.voxy.common.voxelization.InstanceKeyRegistry;
 import me.cortex.voxy.common.world.WorldEngine;
 import net.minecraft.client.Minecraft;
@@ -22,7 +20,6 @@ import net.minecraftforge.client.model.data.ModelData;
 import org.lwjgl.system.MemoryUtil;
 
 import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.atomic.AtomicInteger;
 
 //Bakes real, per-instance textures for camouflage/mimicry blocks (Framed Blocks, Create Copycat,
 // Copycats+ - see CamouflageBlockCompat). These blocks don't use a BlockEntityRenderer for their camo
@@ -86,8 +83,6 @@ public class InstanceModelBaker {
 
     private int nextModelId = FIRST_RESERVED_ID;
     private boolean loggedExhausted = false;
-    //TEMP diagnostic: caps verbose per-bake logging so a short test session doesn't flood the log.
-    private static final AtomicInteger DEBUG_LOG_BUDGET = new AtomicInteger(30);
 
     //Base class of every Create (and Create addon, incl. Copycats+) block entity; its handleUpdateTag reads the same
     // keys as its disk format (see bakeOne). Null when Create isn't installed.
@@ -162,10 +157,8 @@ public class InstanceModelBaker {
     //Time-budgeted rather than count-budgeted: a fixed handful per frame left big camo builds popping in
     // for minutes. At least one bake per tick, then keep going until ~3ms of the frame is used.
     private static final long TICK_BUDGET_NANOS = 3_000_000L;
-    private long lastStatsLog = System.currentTimeMillis();
 
     public void tick(WorldEngine world, int minBudget) {
-        if (!CamoDebug.ENABLED) return;
         long start = System.nanoTime();
         for (int i = 0; ; i++) {
             if (i >= minBudget && System.nanoTime() - start > TICK_BUDGET_NANOS) break;
@@ -175,58 +168,8 @@ public class InstanceModelBaker {
                 this.bakeOne(world, instanceIndex);
             } catch (Exception e) {
                 Logger.error("Voxy: failed to bake camouflage instance " + instanceIndex, e);
-                CamoStats.count(this.blockName(world, instanceIndex), "bake.exception");
                 this.setResolved(instanceIndex, -1);
             }
-        }
-        long now = System.currentTimeMillis();
-        if (now - this.lastStatsLog >= 20_000) {
-            this.lastStatsLog = now;
-            String report = CamoStats.reportIfChanged();
-            if (report != null) {
-                Logger.info("Voxy camo stats (per block: events):" + report);
-            }
-        }
-    }
-
-    //TEMP diagnostic: writes the 6 baked face textures of an instance (top: colour with alpha forced
-    // opaque, bottom: alpha as greyscale) as one enlarged PNG sheet to <gamedir>/voxy_camo_dump/, so
-    // corrupted/garbled bakes can be inspected directly. Bounded by DUMP_BUDGET.
-    private static final AtomicInteger DUMP_BUDGET = new AtomicInteger(300);
-
-    private void dumpBake(int instanceIndex, String blockName, ColourDepthTextureData[] textureData) {
-        try {
-            final int scale = 8;
-            var img = new java.awt.image.BufferedImage(6 * SIZE * scale, 3 * SIZE * scale, java.awt.image.BufferedImage.TYPE_INT_ARGB);
-            for (int face = 0; face < 6; face++) {
-                var c = textureData[face].colour();
-                for (int y = 0; y < SIZE; y++) {
-                    for (int x = 0; x < SIZE; x++) {
-                        int abgr = c[y * SIZE + x];
-                        int a = (abgr >>> 24) & 0xFF;
-                        int argbOpaque = 0xFF000000 | ((abgr & 0xFF) << 16) | (abgr & 0xFF00) | ((abgr >> 16) & 0xFF);
-                        int argbAlpha = 0xFF000000 | (a << 16) | (a << 8) | a;
-                        //Third row: depth of written pixels (dark = near the face, bright = deep), black if unwritten
-                        int dword = textureData[face].depth()[y * SIZE + x];
-                        int dv = (dword & 0xFF) != 0 ? Math.min(255, (int) (((dword >>> 8) / (double) ((1 << 24) - 1)) * 255.0 * 2.0)) : 0;
-                        int argbDepth = 0xFF000000 | (dv << 16) | (dv << 8) | dv;
-                        for (int sy = 0; sy < scale; sy++) {
-                            for (int sx = 0; sx < scale; sx++) {
-                                int px = (face * SIZE + x) * scale + sx;
-                                img.setRGB(px, y * scale + sy, argbOpaque);
-                                img.setRGB(px, (SIZE + y) * scale + sy, argbAlpha);
-                                img.setRGB(px, (2 * SIZE + y) * scale + sy, argbDepth);
-                            }
-                        }
-                    }
-                }
-            }
-            var dir = Minecraft.getInstance().gameDirectory.toPath().resolve("voxy_camo_dump");
-            java.nio.file.Files.createDirectories(dir);
-            var file = dir.resolve(instanceIndex + "_" + blockName.replace(':', '_') + ".png");
-            javax.imageio.ImageIO.write(img, "png", file.toFile());
-        } catch (Throwable t) {
-            Logger.error("Voxy: failed to dump camo bake " + instanceIndex, t);
         }
     }
 
@@ -291,23 +234,15 @@ public class InstanceModelBaker {
         return layer;
     }
 
-    private String blockName(WorldEngine world, int instanceIndex) {
-        var key = world.getInstanceKeyRegistry().getKey(instanceIndex);
-        return key == null ? "<unknown-index>" : String.valueOf(net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(key.wrapperState().getBlock()));
-    }
-
     private void bakeOne(WorldEngine world, int instanceIndex) {
         var key = world.getInstanceKeyRegistry().getKey(instanceIndex);
         if (key == null) {
             //Stale index (its persisted registry entry is missing/unreadable) - nothing we can rebuild it from
-            CamoStats.count("<unknown-index>", "bake.unknownIndex");
             this.setResolved(instanceIndex, -1);
             return;
         }
 
-        final String blockName = String.valueOf(net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(key.wrapperState().getBlock()));
         if (this.nextModelId >= (1 << 16)) {
-            CamoStats.count(blockName, "bake.exhausted");
             if (!this.loggedExhausted) {
                 this.loggedExhausted = true;
                 Logger.warn("Voxy: camouflage instance model capacity (" + RESERVED_COUNT + ") exhausted this session, further instances will show their plain block appearance");
@@ -315,8 +250,6 @@ public class InstanceModelBaker {
             this.setResolved(instanceIndex, -1);
             return;
         }
-
-        boolean debugLog = CamoDebug.DIAGNOSTICS && DEBUG_LOG_BUDGET.getAndDecrement() > 0;
 
         //? if neoforge {
         /*//NeoForge doesn't need instance ModelData for camouflage blocks the same way (kept out of
@@ -359,8 +292,6 @@ public class InstanceModelBaker {
             }
         }
         if (be == null) {
-            CamoStats.count(blockName, "bake.noBE");
-            if (debugLog) Logger.info("Voxy camo bake DEBUG: instance=" + instanceIndex + " state=" + key.wrapperState() + " -> loadStatic returned null, falling back");
             this.setResolved(instanceIndex, -1);
             return;
         }
@@ -378,20 +309,11 @@ public class InstanceModelBaker {
         if ((flags & 16) == 0) {
             //Genuinely no quads produced (e.g. empty/uncamouflaged state, or this block doesn't use
             // ModelData for its camo appearance) - fall back to the plain block forever
-            CamoStats.count(blockName, "bake.noQuads");
-            if (CamoStats.shouldDetail(blockName, "noQuads")) {
-                Logger.warn("Voxy camo bake: NO QUADS for " + key.wrapperState() + " nbt=" + key.nbt());
-            }
-            if (debugLog) Logger.info("Voxy camo bake DEBUG: instance=" + instanceIndex + " state=" + key.wrapperState() + " -> no quads produced, falling back");
             this.setResolved(instanceIndex, -1);
             return;
         }
 
         var textureData = readFaces(this.scratchBuffer);
-        if (debugLog) Logger.info("Voxy camo bake DEBUG: instance=" + instanceIndex + " state=" + key.wrapperState() + " -> got quads, flags=" + flags);
-        if (CamoStats.shouldDetail(blockName, "dump") && DUMP_BUDGET.getAndDecrement() > 0) {
-            this.dumpBake(instanceIndex, blockName, textureData);
-        }
 
         boolean isShaded = (flags & 1) != 0;
         boolean hasDarkenedTextures = (flags & 2) != 0;
@@ -405,7 +327,7 @@ public class InstanceModelBaker {
         // cell light - splitting such a block into depth planes makes each plane "not fully opaque" and turns
         // e.g. solid walls/plinths with a little surface relief dark.
         final boolean solidCube = ModelFactory.instanceIsFullyOpaque(textureData, chooseLayer(textureData, anyTranslucentQuads, anyDiscardQuads, isLeaves));
-        boolean mixed = CamoDebug.MIXED_LAYERS && !solidCube && anyTranslucentQuads && (flags & 32) != 0;
+        boolean mixed = !solidCube && anyTranslucentQuads && (flags & 32) != 0;
         if (mixed) {
             //Glass (translucent) AND opaque geometry in one block: keep them as independent layers instead of
             // the blended composite, so e.g. a brick slab stays behind its glass plate with its own depth and
@@ -432,21 +354,13 @@ public class InstanceModelBaker {
                     this.modelFactory.enqueueUpload(this.modelFactory.buildInstanceModelUpload(ids[n], key.wrapperState(), tex, isShaded, hasDarkenedTextures, RenderType.translucent(), doubleSided, -1));
                     n++;
                 }
-                if (CamoStats.shouldDetail(blockName, "dumpPlane") && DUMP_BUDGET.get() > 0) {
-                    for (int k = 0; k < total; k++) {
-                        DUMP_BUDGET.decrementAndGet();
-                        this.dumpBake(instanceIndex, blockName + "_layer" + k + (k < oPlanes.length ? "opaque" : "translucent"), k < oPlanes.length ? oPlanes[k] : tPlanes[k - oPlanes.length]);
-                    }
-                }
                 this.setSecondary(instanceIndex, java.util.Arrays.copyOfRange(ids, 1, ids.length));
                 modelId = ids[0];
-                CamoStats.count(blockName, "bake.multiLayer");
                 this.setResolved(instanceIndex, modelId);
-                CamoStats.count(blockName, "bake.ok");
                 return;
             }
         }
-        var planes = (CamoDebug.MULTI_PLANE && !solidCube) ? ModelPlaneSplitter.split(textureData) : null;
+        var planes = !solidCube ? ModelPlaneSplitter.split(textureData) : null;
         if (planes != null && this.nextModelId + planes.length <= (1 << 16)) {
             //Stepped/layered model: one Voxy model per depth plane (nearest first), primary + secondaries
             int[] ids = new int[planes.length];
@@ -458,38 +372,15 @@ public class InstanceModelBaker {
                 var layer = chooseLayer(planes[plane], anyTranslucentQuads, anyDiscardQuads, isLeaves);
                 this.modelFactory.enqueueUpload(this.modelFactory.buildInstanceModelUpload(ids[plane], key.wrapperState(), planes[plane], isShaded, hasDarkenedTextures, layer, doubleSided, fullyOpaque));
             }
-            if (CamoStats.shouldDetail(blockName, "dumpPlane") && DUMP_BUDGET.get() > 0) {
-                for (int plane = 0; plane < planes.length; plane++) {
-                    DUMP_BUDGET.decrementAndGet();
-                    this.dumpBake(instanceIndex, blockName + "_plane" + plane, planes[plane]);
-                    var sb = new StringBuilder();
-                    for (int face = 0; face < 6; face++) {
-                        int written = TextureUtils.getWrittenPixelCount(planes[plane][face], TextureUtils.WRITE_CHECK_STENCIL);
-                        float depth = written == 0 ? -1 : TextureUtils.computeDepth(planes[plane][face], TextureUtils.DEPTH_MODE_AVG, TextureUtils.WRITE_CHECK_STENCIL);
-                        var bounds = written == 0 ? new int[]{-1, -1, -1, -1} : TextureUtils.computeBounds(planes[plane][face], TextureUtils.WRITE_CHECK_STENCIL);
-                        sb.append(String.format(" f%d[n=%d d=%.2f b=%s]", face, written, depth, java.util.Arrays.toString(bounds)));
-                    }
-                    Logger.info("Voxy camo planes: " + key.wrapperState() + " instance=" + instanceIndex + " plane" + plane + sb);
-                }
-            }
             //Registered before the primary is marked resolved so the mesher never sees a primary without them
             this.setSecondary(instanceIndex, java.util.Arrays.copyOfRange(ids, 1, ids.length));
             modelId = ids[0];
-            CamoStats.count(blockName, "bake.multiPlane");
         } else {
             modelId = this.nextModelId++;
             var layer = chooseLayer(textureData, anyTranslucentQuads, anyDiscardQuads, isLeaves);
             this.modelFactory.enqueueUpload(this.modelFactory.buildInstanceModelUpload(modelId, key.wrapperState(), textureData, isShaded, hasDarkenedTextures, layer));
         }
         this.setResolved(instanceIndex, modelId);
-        CamoStats.count(blockName, "bake.ok");
-        if (CamoStats.shouldDetail(blockName, "ok")) {
-            var bb = this.bakery.dbgBounds;
-            Logger.info("Voxy camo bake OK: " + key.wrapperState() + " quads=" + this.bakery.dbgQuadCount
-                    + String.format(" bounds=[%.2f,%.2f,%.2f]-[%.2f,%.2f,%.2f]", bb[0], bb[1], bb[2], bb[3], bb[4], bb[5])
-                    + " flags=" + flags + " nbt=" + key.nbt());
-        }
-        if (debugLog) Logger.info("Voxy camo bake DEBUG: instance=" + instanceIndex + " -> baked OK, modelId=" + modelId);
         //? } else {
         /*//Fabric doesn't have Forge's ModelData system - no way to recover the camo texture here yet,
         // fall back to plain per-BlockState behaviour.
