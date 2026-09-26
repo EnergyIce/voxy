@@ -158,6 +158,179 @@ public class ModelFactory {
     private static final record BlockBake(int blockId, BlockState state) {
     }
 
+    //Lets external callers (InstanceModelBaker) push a pre-built upload into the same queue that
+    // processUploads() already drains every frame, so no separate upload-pump is needed for it.
+    public void enqueueUpload(ModelBakeResultUpload upload) {
+        this.uploadResults.add(upload);
+    }
+
+    //Simplified sibling of processTextureBakeResult() for callers that already have a modelId
+    // (per-instance camouflage bakes - see InstanceModelBaker - allocate their own id range and
+    // dedupe by instance key rather than by BlockState, so they don't go through the blockId/
+    // ModelEntry dedup bookkeeping above). Reuses the exact same per-face metadata/occlusion/
+    // translucency analysis as the normal path (TextureUtils is generic over any
+    // ColourDepthTextureData, regardless of how it was rendered).
+    //
+    // Simplifications valid specifically for camouflage/mimicry blocks (Framed Blocks, Create
+    // Copycat, Copycats+): never a fluid, never registered with a vanilla BlockColor provider.
+    //Whether a model needs Voxy's "double sided" quad handling (both faces of an axis empty, plant-like).
+    // Must be decided on the COMPLETE model: a single depth-plane of a stepped model can legitimately have
+    // both faces of an axis empty without the block being plant-like, and flagging it double-sided made the
+    // mesher place that plane's quads at the block edge instead of at its depth.
+    public static boolean instanceNeedsDoubleSided(ColourDepthTextureData[] textureData, RenderType layer) {
+        int checkMode = layer==RenderType.solid()?TextureUtils.WRITE_CHECK_STENCIL:TextureUtils.WRITE_CHECK_ALPHA;
+        var depths = computeModelDepth(textureData, checkMode, layer!=RenderType.solid()?TextureUtils.DEPTH_MODE_MIN:TextureUtils.DEPTH_MODE_AVG);
+        return (depths[0] < -0.1 && depths[1] < -0.1) || (depths[2] < -0.1 && depths[3] < -0.1) || (depths[4] < -0.1 && depths[5] < -0.1);
+    }
+
+    //Whether the COMPLETE model is a fully opaque cube by Voxy's own criteria (every face covered >90% by opaque
+    // pixels at a depth <0.1). Used for split (multi-plane) models: each plane on its own covers less, but the
+    // block as a whole is still a solid cube, and Voxy uses this bit both to occlude neighbours and to pick the
+    // light (opaque cells take the light of their neighbour, because their own cell light is 0). Without this a
+    // solid block with deep relief (split into planes) fell back to its own, dark, cell light.
+    public static boolean instanceIsFullyOpaque(ColourDepthTextureData[] textureData, RenderType layer) {
+        int checkMode = layer==RenderType.solid()?TextureUtils.WRITE_CHECK_STENCIL:TextureUtils.WRITE_CHECK_ALPHA;
+        var depths = computeModelDepth(textureData, checkMode, layer!=RenderType.solid()?TextureUtils.DEPTH_MODE_MIN:TextureUtils.DEPTH_MODE_AVG);
+        for (int face = 0; face < 6; face++) {
+            float offset = depths[face];
+            if (offset < -0.1 || offset >= 0.1) return false;
+            if (layer == RenderType.translucent() && !TextureUtils.isSolidWhereDrawn(textureData[face])) return false;
+            int writeCount = TextureUtils.getWrittenPixelCount(textureData[face], checkMode);
+            if (((float) writeCount) / (MODEL_TEXTURE_SIZE * MODEL_TEXTURE_SIZE) <= 0.9) return false;
+        }
+        return true;
+    }
+
+    public ModelBakeResultUpload buildInstanceModelUpload(int modelId, BlockState blockState, ColourDepthTextureData[] textureData, boolean isShaded, boolean darkenedTinting, RenderType layer) {
+        return this.buildInstanceModelUpload(modelId, blockState, textureData, isShaded, darkenedTinting, layer, -1, -1);
+    }
+
+    //doubleSidedOverride: -1 = derive from these textures, 0/1 = force (used for the plane models of a split model)
+    public ModelBakeResultUpload buildInstanceModelUpload(int modelId, BlockState blockState, ColourDepthTextureData[] textureData, boolean isShaded, boolean darkenedTinting, RenderType layer, int doubleSidedOverride) {
+        return this.buildInstanceModelUpload(modelId, blockState, textureData, isShaded, darkenedTinting, layer, doubleSidedOverride, -1);
+    }
+
+    //fullyOpaqueOverride: -1 = derive from these textures, 0/1 = force (plane models of a split solid block)
+    public ModelBakeResultUpload buildInstanceModelUpload(int modelId, BlockState blockState, ColourDepthTextureData[] textureData, boolean isShaded, boolean darkenedTinting, RenderType layer, int doubleSidedOverride, int fullyOpaqueOverride) {
+        int checkMode = layer==RenderType.solid()?TextureUtils.WRITE_CHECK_STENCIL:TextureUtils.WRITE_CHECK_ALPHA;
+
+        ModelBakeResultUpload uploadResult = new ModelBakeResultUpload();
+        uploadResult.modelId = modelId;
+        long uploadPtr = uploadResult.model.address;
+
+        var depths = computeModelDepth(textureData, checkMode, layer!=RenderType.solid()?TextureUtils.DEPTH_MODE_MIN:TextureUtils.DEPTH_MODE_AVG);
+
+        boolean needsDoubleSidedQuads = (depths[0] < -0.1 && depths[1] < -0.1) || (depths[2] < -0.1 && depths[3] < -0.1) || (depths[4] < -0.1 && depths[5] < -0.1);
+        if (doubleSidedOverride >= 0) needsDoubleSidedQuads = doubleSidedOverride == 1;
+
+        boolean cullsSame;
+        {
+            boolean allTrue = true;
+            for (var dir : Direction.values()) {
+                if (!blockState.skipRendering(blockState, dir)) {
+                    allTrue = false;
+                    break;
+                }
+            }
+            cullsSame = allTrue;
+        }
+
+        long metadata = 0;
+        metadata |= layer == RenderType.translucent()?2:0;
+        metadata |= needsDoubleSidedQuads?4:0;
+        metadata |= cullsSame?32:0;
+
+        boolean fullyOpaque = true;
+
+        for (int face = 5; face != -1; face--) {
+            long faceUploadPtr = uploadPtr + 4L * face;
+            metadata <<= 8;
+            float offset = depths[face];
+            if (offset < -0.1) {
+                metadata |= 0xFF;
+                MemoryUtil.memPutInt(faceUploadPtr, -1);
+                fullyOpaque = false;
+                continue;
+            }
+            var faceSize = TextureUtils.computeBounds(textureData[face], checkMode);
+            int writeCount = TextureUtils.getWrittenPixelCount(textureData[face], checkMode);
+
+            boolean faceCoversFullBlock = faceSize[0] == 0 && faceSize[2] == 0 &&
+                    faceSize[1] == (MODEL_TEXTURE_SIZE-1) && faceSize[3] == (MODEL_TEXTURE_SIZE-1);
+
+            metadata |= faceCoversFullBlock?2:0;
+
+            boolean occludesFace = true;
+            //A translucent MODEL can still have fully opaque FACES (e.g. a glass step plus a brick wall in one
+            // block: the brick side is solid). Judging occlusion per face instead of by the model's layer lets
+            // such a face cull the opposing coplanar face of its neighbour, instead of both being drawn on the
+            // same plane and z-fighting.
+            occludesFace &= layer != RenderType.translucent() || (me.cortex.voxy.common.voxelization.CamoDebug.FACE_OCCLUSION && TextureUtils.isSolidWhereDrawn(textureData[face]));
+            occludesFace &= offset < 0.1;
+            if (occludesFace) {
+                occludesFace &= ((float)writeCount)/(MODEL_TEXTURE_SIZE * MODEL_TEXTURE_SIZE) > 0.9;
+            }
+            metadata |= occludesFace?1:0;
+            fullyOpaque &= occludesFace;
+
+            boolean canBeOccluded = true;
+            canBeOccluded &= offset < 0.3;
+            metadata |= canBeOccluded?4:0;
+
+            metadata |= (offset > 0.01 || layer == RenderType.translucent())?0b1000:0;
+
+            if (MODEL_TEXTURE_SIZE-1 != 15) {
+                for (int i = 0; i < 4; i++) {
+                    faceSize[i] = Math.round((((float) faceSize[i]) / (MODEL_TEXTURE_SIZE - 1)) * 15);
+                }
+            }
+
+            int faceModelData = 0;
+            faceModelData |= faceSize[0] | (faceSize[1]<<4) | (faceSize[2]<<8) | (faceSize[3]<<12);
+            int enc = Math.round(offset*64);
+            faceModelData |= Math.min(enc,62)<<16;
+
+            int area = (faceSize[1]-faceSize[0]+1) * (faceSize[3]-faceSize[2]+1);
+            boolean needsAlphaDiscard = ((float)writeCount)/area<0.9;
+            needsAlphaDiscard |= layer != RenderType.solid();
+            needsAlphaDiscard &= layer != RenderType.translucent();
+            faceModelData |= needsAlphaDiscard?1<<22:0;
+
+            faceModelData |= ((!faceCoversFullBlock)&&layer != RenderType.translucent())?1<<23:0;
+            //No tint bits: camouflage/mimicry blocks are never registered with a vanilla BlockColor provider
+
+            MemoryUtil.memPutInt(faceUploadPtr, faceModelData);
+        }
+
+        if (fullyOpaqueOverride >= 0) fullyOpaque = fullyOpaqueOverride == 1;
+        metadata |= fullyOpaque?(1L<<(48+6)):0;
+        metadata |= ((long)getBlockLightEmission(blockState))<<(48+7);
+
+        this.metadataCache[modelId] = metadata;
+
+        uploadPtr += 4*6;
+        int modelFlags = 0;
+        modelFlags |= layer == RenderType.translucent()?4:0;
+        modelFlags |= isShaded?8:0;
+        //Single sided (see block_model.glsl): the quads of a camouflage instance are outer-face views and must
+        // not be visible from behind. Plant-like (double sided) models keep both sides.
+        modelFlags |= (needsDoubleSidedQuads || !me.cortex.voxy.common.voxelization.CamoDebug.SINGLE_SIDED)?0:16;
+        MemoryUtil.memPutInt(uploadPtr, modelFlags); uploadPtr += 4;
+
+        //No colour provider -> nothing to sample, tell the GPU to skip it
+        MemoryUtil.memPutInt(uploadPtr, -1); uploadPtr += 4;
+
+        if (this.customBlockStateIdMapping != null && this.customBlockStateIdMapping.containsKey(blockState)) {
+            MemoryUtil.memPutInt(uploadPtr, this.customBlockStateIdMapping.getInt(blockState));
+        } else {
+            MemoryUtil.memPutInt(uploadPtr, 0);
+        }
+
+        MipGen.putTextures(darkenedTinting, textureData, uploadResult.texture);
+
+        return uploadResult;
+    }
+
     public boolean addEntry(int blockId) {
         if (this.idMappings[blockId] != -1) {
             return false;
@@ -340,12 +513,12 @@ public class ModelFactory {
         UploadStream.INSTANCE.commit();
     }
 
-    private interface ResultUploader {
+    interface ResultUploader {
         void upload(ModelStore store);
         void free();
     }
 
-    private static final class ModelBakeResultUpload implements ResultUploader {
+    static final class ModelBakeResultUpload implements ResultUploader {
         private final MemoryBuffer model = new MemoryBuffer(MODEL_SIZE).zero();
         private final MemoryBuffer texture = new MemoryBuffer((2L*3*computeSizeWithMips(MODEL_TEXTURE_SIZE))*4);
 

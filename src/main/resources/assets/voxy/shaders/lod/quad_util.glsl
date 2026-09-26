@@ -35,7 +35,7 @@ struct QuadData {
 };
 
 uint makeQuadFlags(uint faceData, uint modelId, ivec2 quadSize, const in BlockModel model, uint face) {
-    //bit: 0-use cuttout, 1-dont use mipmaps, 2|3-tint state, 4|6-face, 8|11-width, 12|15-height, 16|31-model id
+    //bit: 0-use cuttout, 1-dont use mipmaps, 2|3-tint state, 4|6-face, 7-single sided, 8|11-width, 12|15-height, 16|31-model id
     uint flags = 0;
 
     flags |= modelId<<16;//Model id
@@ -51,6 +51,7 @@ uint makeQuadFlags(uint faceData, uint modelId, ivec2 quadSize, const in BlockMo
 
     flags |= faceTintState(faceData)<<2;
     flags |= face<<4;//Face
+    flags |= uint(modelIsSingleSided(model))<<7;//Cull fragments seen from behind (bit 7 is otherwise unused)
 
     return flags;
 }

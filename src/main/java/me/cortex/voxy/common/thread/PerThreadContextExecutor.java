@@ -77,8 +77,14 @@ public class PerThreadContextExecutor extends TrackedObject {
             ctx.execute.run();
         } catch (Exception e) {
             this.exceptionHandler.accept(e);
+        } finally {
+            //Must run even if something other than a plain Exception (e.g. an Error, from a corrupt-
+            //data-driven OutOfMemoryError or similar) escapes ctx.execute.run() uncaught above - this
+            //counter going stuck at nonzero is exactly what makes shutdown() spin forever with zero
+            //diagnostics (it only Thread.onSpinWait()s on it, no timeout), which looks like a silent
+            //game freeze on disconnect rather than a crash.
+            this.currentRunning.decrementAndGet();
         }
-        this.currentRunning.decrementAndGet();
         return true;
     }
 

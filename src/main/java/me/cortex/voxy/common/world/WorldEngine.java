@@ -3,6 +3,7 @@ package me.cortex.voxy.common.world;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.config.section.SectionStorage;
 import me.cortex.voxy.common.util.TrackedObject;
+import me.cortex.voxy.common.voxelization.InstanceKeyRegistry;
 import me.cortex.voxy.common.world.other.Mapper;
 import me.cortex.voxy.commonImpl.VoxyInstance;
 import org.jetbrains.annotations.Nullable;
@@ -26,6 +27,7 @@ public class WorldEngine {
 
     public final SectionStorage storage;
     private final Mapper mapper;
+    private final InstanceKeyRegistry instanceKeyRegistry;
     private final ActiveSectionTracker sectionTracker;
     private ISectionChangeCallback dirtyCallback;
     private ISectionSaveCallback saveCallback;
@@ -40,6 +42,7 @@ public class WorldEngine {
     }
 
     public Mapper getMapper() {return this.mapper;}
+    public InstanceKeyRegistry getInstanceKeyRegistry() {return this.instanceKeyRegistry;}
     public boolean isLive() {return this.isLive;}
 
     public final @Nullable VoxyInstance instanceIn;
@@ -60,6 +63,7 @@ public class WorldEngine {
 
         this.storage = storage;
         this.mapper = new Mapper(this.storage);
+        this.instanceKeyRegistry = new InstanceKeyRegistry(this.mapper);
         //5 cache size bits means that the section tracker has 32 separate maps that it uses
         this.sectionTracker = new ActiveSectionTracker(6, storage::loadSection, cacheSize, this);
     }
@@ -135,6 +139,11 @@ public class WorldEngine {
 
     public int getActiveSectionCount() {
         return this.sectionTracker.getLoadedCacheCount();
+    }
+
+    //Diagnostic-only accessor for isWorldUsed()'s other half - see VoxyInstance#shutdown()'s stall log.
+    public int getRefCount() {
+        return this.refCount.get();
     }
 
     public void free() {

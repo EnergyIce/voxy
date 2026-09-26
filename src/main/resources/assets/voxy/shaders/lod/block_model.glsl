@@ -42,3 +42,10 @@ bool modelIsTranslucent(BlockModel model) {
 bool modelIsShaded(BlockModel model) {
     return ((model.flagsA)&8u) != 0;
 }
+
+//Single sided models (all camouflage instance models that are not plant-like): their face quads are only
+// valid when seen from the outside. Voxy renders with back face culling disabled, so without this the
+// quads of the far side of an open/translucent model shine through from behind.
+bool modelIsSingleSided(BlockModel model) {
+    return ((model.flagsA)&16u) != 0;
+}

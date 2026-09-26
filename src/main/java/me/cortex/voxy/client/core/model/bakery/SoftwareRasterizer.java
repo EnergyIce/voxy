@@ -3,7 +3,6 @@ package me.cortex.voxy.client.core.model.bakery;
 import me.cortex.voxy.client.core.model.ModelFactory;
 import net.caffeinemc.mods.sodium.api.util.ColorABGR;
 import net.caffeinemc.mods.sodium.api.util.ColorARGB;
-import net.caffeinemc.mods.sodium.api.util.ColorMixer;
 import org.joml.Matrix4f;
 import org.joml.Vector3f;
 import org.joml.Vector4f;
@@ -214,6 +213,19 @@ public class SoftwareRasterizer {
     }
 
 
+    //dst*w + scr*(1-w) per RGB channel with w = alpha/255. Deliberately NOT Sodium/Embeddium's
+    // ColorMixer.mix: its third parameter is a float ratio (0..1) in Embeddium 0.3.x (1.20.1) but an
+    // int weight (0..255) in Sodium 0.6 (1.21.1), and passing the int on 1.20.1 silently widens 255 to
+    // 255.0f, overflowing the maths into random per-pixel colours whenever translucent pixels were
+    // blended over already-rasterised ones (e.g. glass beside/over bricks in one model).
+    private static int mixRGB(int a, int b, int alpha) {
+        int wA = alpha + (alpha >>> 7);//0..255 -> 0..256 so full alpha is exactly a
+        int wB = 256 - wA;
+        int rb = (((a & 0x00FF00FF) * wA + (b & 0x00FF00FF) * wB) >>> 8) & 0x00FF00FF;
+        int g = (((a & 0x0000FF00) * wA + (b & 0x0000FF00) * wB) >>> 8) & 0x0000FF00;
+        return rb | g;
+    }
+
     // ARBDrawBuffersBlend.glBlendFuncSeparateiARB(0, GL_ONE_MINUS_DST_ALPHA, GL_DST_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
     private static int doBlending(int scr, int dst) {
         int srcAlpha = (scr>>>24)&0xFF;
@@ -226,7 +238,7 @@ public class SoftwareRasterizer {
         int blendAlpha = Math.min(0xFF,srcAlpha+((dstAlpha*(255-srcAlpha))>>8));
         //how much did we actually get
 
-        int blend = ColorMixer.mix(dst, scr, dstAlpha);//addRGB(ColorABGR.mulRGB(scr, 255-dstAlpha),ColorABGR.mulRGB(dst, dstAlpha));
+        int blend = mixRGB(dst, scr, dstAlpha);
         return blend|(blendAlpha<<24);
     }
 

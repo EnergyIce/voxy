@@ -6,10 +6,17 @@ import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 
 import me.cortex.voxy.client.core.model.ModelFactory;
+import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.util.UnsafeUtil;
+//? if neoforge {
+/*import net.neoforged.neoforge.client.model.data.ModelData;*/
+//? } else if forge {
+import net.minecraftforge.client.model.data.ModelData;
+//?}
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.ItemBlockRenderTypes;
 import net.minecraft.client.renderer.RenderType;
+import net.minecraft.client.renderer.block.model.BakedQuad;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.resources.ResourceLocation;
@@ -51,7 +58,10 @@ import static org.lwjgl.opengl.GL30C.glBindFramebuffer;
 
 public class SoftwareModelTextureBakery {
     // Note: the first bit of metadata is if alpha discard is enabled
-    private static final Matrix4f[] VIEWS = new Matrix4f[6];
+    //Public so InstanceModelBaker (real GL rendering of BlockEntities) can reuse the exact same
+    // 6 view/projection matrices, so its output aligns pixel-for-pixel with this software-rasterized
+    // per-BlockState output in the shared atlas.
+    public static final Matrix4f[] VIEWS = new Matrix4f[6];
 
     private final ReuseVertexConsumer opaqueVC = new ReuseVertexConsumer();
     private final ReuseVertexConsumer translucentVC = new ReuseVertexConsumer(1/*has discard*/);
@@ -106,13 +116,254 @@ public class SoftwareModelTextureBakery {
 
         for (Direction direction : new Direction[] { Direction.DOWN, Direction.UP, Direction.NORTH, Direction.SOUTH,
                 Direction.WEST, Direction.EAST, null }) {
-            var quads = model.getQuads(state, direction, new SingleThreadedRandomSource(42L));
+            List<BakedQuad> quads;
+            try {
+                //Some third-party mods' BakedModel implementations assume they're only ever queried
+                // from the normal chunk-render pipeline (e.g. relying on a Guava LoadingCache whose
+                // loader needs render context that isn't available here) and can throw when baked
+                // headlessly like this. One bad BlockState's model must not take down the whole
+                // "Model factory processor" thread (which is fatal - see ModelBakerySubsystem#tick),
+                // so treat a throw here the same as that direction legitimately having no quads.
+                quads = model.getQuads(state, direction, new SingleThreadedRandomSource(42L));
+            } catch (Exception e) {
+                Logger.error("Voxy: a block model threw while baking " + state + " (face " + direction + "), skipping that face", e);
+                continue;
+            }
             for (var quad : quads) {
                 (layer == RenderType.translucent() ? this.translucentVC : this.opaqueVC)
                         .quad(quad, state.is(BlockTags.LEAVES), layer);
             }
         }
     }
+
+    //? if forge || neoforge {
+    //Diagnostics of the last renderToOutputWithModelData(): emitted quad count and their model-space
+    // bounds (minX,minY,minZ,maxX,maxY,maxZ) - lets a log show whether a camo model produced sane geometry.
+    public int dbgQuadCount;
+    public final float[] dbgBounds = new float[6];
+
+    private void bakeBlockModelWithData(BlockState state, RenderType layer, ModelData modelData) {
+        if (state.getRenderShape() == RenderShape.INVISIBLE) {
+            return;// Dont bake if invisible
+        }
+        var model = Minecraft.getInstance()
+                .getModelManager()
+                .getBlockModelShaper()
+                .getBlockModel(state);
+
+        for (Direction direction : new Direction[] { Direction.DOWN, Direction.UP, Direction.NORTH, Direction.SOUTH,
+                Direction.WEST, Direction.EAST, null }) {
+            List<BakedQuad> quads;
+            try {
+                //See the equivalent try/catch in bakeBlockModel() above for why this is needed.
+                quads = model.getQuads(state, direction, new SingleThreadedRandomSource(42L), modelData, layer);
+            } catch (Exception e) {
+                Logger.error("Voxy: a block model threw while baking instance appearance for " + state + " (face " + direction + "), skipping that face", e);
+                continue;
+            }
+            for (var quad : quads) {
+                int[] verts = quad.getVertices();
+                for (int v = 0; v < 4; v++) {
+                    for (int c = 0; c < 3; c++) {
+                        float f = Float.intBitsToFloat(verts[v * 8 + c]);
+                        this.dbgBounds[c] = Math.min(this.dbgBounds[c], f);
+                        this.dbgBounds[3 + c] = Math.max(this.dbgBounds[3 + c], f);
+                    }
+                }
+                this.dbgQuadCount++;
+                (layer == RenderType.translucent() ? this.translucentVC : this.opaqueVC)
+                        .quad(quad, state.is(BlockTags.LEAVES), layer);
+            }
+        }
+    }
+
+    //Sibling of renderToOutput() for instance-specific bakes (camouflage/mimicry blocks like Framed
+    // Blocks/Create Copycat) that need per-instance ModelData - e.g. Framed Blocks' custom baked models
+    // (FramedCubeModel etc.) read the camo BlockState out of ModelData rather than using a
+    // BlockEntityRenderer, so plain per-BlockState baking (ModelData.EMPTY) always yields the bare/
+    // uncamouflaged appearance. Solid-block only (no fluids), which covers every known camo block.
+    public int renderToOutputWithModelData(BlockState state, long outputBuffer, ModelData modelData) {
+        return this.renderToOutputWithModelData(state, outputBuffer, modelData, null);
+    }
+
+    //Minimal single-block "world" for BakedModel#getModelData(): the real block state + block entity
+    // at ZERO, air everywhere else, so models that gather neighbour/occlusion/material data from the
+    // level (Copycats+, Framed Blocks) see a self-consistent isolated block instead of whatever
+    // happens to be at the world origin.
+    private static final class IsolatedBlockGetter implements BlockAndTintGetter {
+        private final BlockState state;
+        private final BlockEntity blockEntity;
+
+        private IsolatedBlockGetter(BlockState state, BlockEntity blockEntity) {
+            this.state = state;
+            this.blockEntity = blockEntity;
+        }
+
+        @Override
+        public LevelLightEngine getLightEngine() {
+            var level = Minecraft.getInstance().level;
+            return level == null ? null : level.getLightEngine();
+        }
+
+        @Override
+        public int getBrightness(LightLayer type, BlockPos pos) {
+            return type == LightLayer.SKY ? 15 : 0;
+        }
+
+        @Override
+        public int getBlockTint(BlockPos pos, ColorResolver colorResolver) {
+            return -1;
+        }
+
+        @Nullable
+        @Override
+        public BlockEntity getBlockEntity(BlockPos pos) {
+            return pos.equals(BlockPos.ZERO) ? this.blockEntity : null;
+        }
+
+        @Override
+        public BlockState getBlockState(BlockPos pos) {
+            return pos.equals(BlockPos.ZERO) ? this.state : Blocks.AIR.defaultBlockState();
+        }
+
+        @Override
+        public FluidState getFluidState(BlockPos pos) {
+            return this.getBlockState(pos).getFluidState();
+        }
+
+        @Override
+        public int getHeight() {
+            return 16;
+        }
+
+        @Override
+        public int getMinBuildHeight() {
+            return 0;
+        }
+
+        @Override
+        public float getShade(Direction direction, boolean bl) {
+            return 1.0f;
+        }
+    }
+
+    //blockEntity may be null. When given, the model gets to build its own ModelData from it - many
+    // camo/copycat models (Copycats+ "MATERIALS"/"OCCLUSION"/"WRAPPED_DATA", Framed Blocks' neighbour
+    // data) are assembled in BakedModel#getModelData(level, pos, state, beData), NOT in the block
+    // entity, and return no quads at all without it. It also bakes every render layer the model
+    // reports (a copycat wrapping glass/leaves lives in translucent/cutout, not the wrapper's own layer).
+    public int renderToOutputWithModelData(BlockState state, long outputBuffer, ModelData modelData, @Nullable BlockEntity blockEntity) {
+        return this.renderToOutputWithModelData(state, outputBuffer, modelData, blockEntity, 0, 0);
+    }
+
+    //opaqueOut / translucentOut (0 = skip): additionally receive the opaque-only and the translucent-only
+    // renderings of the same model, same layout as outputBuffer. The composite in outputBuffer blends
+    // translucent surfaces over the opaque ones behind them, which destroys the depth of what lies behind
+    // (glass in front of bricks becomes one flush "brick-tinted glass" pixel); the separate layers let the
+    // caller keep glass and bricks as independent planes. Extra return bit 32: the model has opaque quads.
+    public int renderToOutputWithModelData(BlockState state, long outputBuffer, ModelData modelData, @Nullable BlockEntity blockEntity, long opaqueOut, long translucentOut) {
+        MemoryUtil.memSet(outputBuffer, 0, 16 * 16 * 8 * 6);
+        if (opaqueOut != 0) MemoryUtil.memSet(opaqueOut, 0, 16 * 16 * 8 * 6);
+        if (translucentOut != 0) MemoryUtil.memSet(translucentOut, 0, 16 * 16 * 8 * 6);
+
+        this.opaqueVC.reset();
+        this.translucentVC.reset();
+        this.dbgQuadCount = 0;
+        java.util.Arrays.fill(this.dbgBounds, 0, 3, Float.MAX_VALUE);
+        java.util.Arrays.fill(this.dbgBounds, 3, 6, -Float.MAX_VALUE);
+
+        var model = Minecraft.getInstance().getModelManager().getBlockModelShaper().getBlockModel(state);
+        if (blockEntity != null) {
+            try {
+                modelData = model.getModelData(new IsolatedBlockGetter(state, blockEntity), BlockPos.ZERO, state, modelData);
+            } catch (Exception e) {
+                Logger.error("Voxy: a block model threw while gathering model data for " + state + ", baking with the block entity's own data only", e);
+            }
+        }
+
+        List<RenderType> layers = new ArrayList<>();
+        try {
+            for (var rt : model.getRenderTypes(state, new SingleThreadedRandomSource(42L), modelData)) {
+                layers.add(rt);
+            }
+        } catch (Exception e) {
+            Logger.error("Voxy: a block model threw while listing render types for " + state, e);
+        }
+        if (layers.isEmpty()) {
+            layers.add(ItemBlockRenderTypes.getChunkRenderType(state));
+        }
+        boolean isLeaves = state.getBlock() instanceof LeavesBlock;
+        for (var layer : layers) {
+            this.bakeBlockModelWithData(state, isLeaves ? RenderType.solid() : layer, modelData);
+        }
+        boolean isAnyShaded = this.opaqueVC.anyShaded | this.translucentVC.anyShaded;
+        boolean isAnyDarkend = this.opaqueVC.anyDarkendTex | this.translucentVC.anyDarkendTex;
+        boolean anyTranslucent = !this.translucentVC.isEmpty();
+        boolean anyDiscard = this.opaqueVC.anyDiscard;
+        //Same "is there actually anything to rasterize" gate the normal per-BlockState path uses -
+        // exposed via bit 4 so callers (InstanceModelBaker) can tell "genuinely empty model" apart
+        // from "model has content" without having to reverse-engineer the rasterizer's pixel format.
+        boolean hadAnyQuads = !(this.opaqueVC.isEmpty() && this.translucentVC.isEmpty());
+        if (hadAnyQuads) {
+            for (int i = 0; i < VIEWS.length; i++) {
+                boolean cull = i == 1 || i == 2 || i == 4;
+                this.rasterizer.clear();
+                //Two-sided: what a face texture must capture is the nearest surface seen from that direction,
+                // independent of triangle winding. The single-sided vanilla setup silently drops one winding
+                // per view, which for composite camo models (parts at different depths, mirrored/rotated
+                // pieces) showed the wrong side's surfaces on the wrong face. The conventional
+                // (front-facing) orientation is drawn first so that strict depth testing keeps translucent
+                // surfaces from being blended twice by their own back faces.
+                this.rasterizer.setBlending(false);
+                this.rasterizer.setFaceCull(cull);
+                this.rasterizer.raster(VIEWS[i], this.opaqueVC);
+                this.rasterizer.setFaceCull(!cull);
+                this.rasterizer.raster(VIEWS[i], this.opaqueVC);
+                this.rasterizer.setBlending(true);
+                this.rasterizer.setFaceCull(cull);
+                this.rasterizer.raster(VIEWS[i], this.translucentVC);
+                this.rasterizer.setFaceCull(!cull);
+                this.rasterizer.raster(VIEWS[i], this.translucentVC);
+                UnsafeUtil.memcpy(this.rasterizer.getRawFramebuffer(),
+                        outputBuffer + (SINGLE_FACE_OUTPUT_SIZE * i));
+
+                if (opaqueOut != 0) {
+                    this.rasterizer.clear();
+                    this.rasterizer.setBlending(false);
+                    this.rasterizer.setFaceCull(cull);
+                    this.rasterizer.raster(VIEWS[i], this.opaqueVC);
+                    this.rasterizer.setFaceCull(!cull);
+                    this.rasterizer.raster(VIEWS[i], this.opaqueVC);
+                    UnsafeUtil.memcpy(this.rasterizer.getRawFramebuffer(), opaqueOut + (SINGLE_FACE_OUTPUT_SIZE * i));
+                }
+                if (translucentOut != 0) {
+                    if (opaqueOut != 0) {
+                        //Depth test the translucent layer against the opaque layer that was just rasterised
+                        // (keep only the depth bits, drop colour and stencil): translucent surfaces BEHIND
+                        // opaque ones are hidden and must not end up in the translucent texture. That removes
+                        // internal faces between parts of one block (e.g. the face where a glass part touches a
+                        // brick part) which the game never draws because its neighbour part hides them.
+                        var fb = this.rasterizer.getRawFramebuffer();
+                        for (int px = 0; px < fb.length; px++) {
+                            fb[px] &= 0xFFFFFF0000000000L;
+                        }
+                    } else {
+                        this.rasterizer.clear();
+                    }
+                    this.rasterizer.setBlending(true);
+                    this.rasterizer.setFaceCull(cull);
+                    this.rasterizer.raster(VIEWS[i], this.translucentVC);
+                    this.rasterizer.setFaceCull(!cull);
+                    this.rasterizer.raster(VIEWS[i], this.translucentVC);
+                    UnsafeUtil.memcpy(this.rasterizer.getRawFramebuffer(), translucentOut + (SINGLE_FACE_OUTPUT_SIZE * i));
+                }
+            }
+        }
+
+        boolean anyOpaque = !this.opaqueVC.isEmpty();
+        return (isAnyShaded ? 1 : 0) | (isAnyDarkend ? 2 : 0) | (anyTranslucent ? 4 : 0) | (anyDiscard ? 8 : 0) | (hadAnyQuads ? 16 : 0) | (anyOpaque ? 32 : 0);
+    }
+    //?}
 
     private void bakeFluidState(BlockState state, int face, RenderType layer) {
         BlockAndTintGetter getter = new BlockAndTintGetter() {

@@ -156,6 +156,16 @@ void main() {
         return;
     }
 
+    //Single sided models: drop fragments of quads that are seen from behind (culling is disabled globally).
+    // Same front/back determination the patched shader path uses to flip the face for lighting.
+    if ((interData.x&0x80u)!=0u) {
+        uint f = getFace();
+        if ((f&1u) != uint(gl_FrontFacing != ((f>>1)!=0u))) {
+            discard;
+            return;
+        }
+    }
+
     //Check the minimum bounding texture and ensure we are greater than it
     if (DEPTH_SCALAR_COMPARE(gl_FragCoord.z, texelFetch(depthTex, ivec2(gl_FragCoord.xy), 0).r)) {
         discard;

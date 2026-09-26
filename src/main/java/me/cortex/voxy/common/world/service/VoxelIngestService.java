@@ -3,6 +3,7 @@ package me.cortex.voxy.common.world.service;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.thread.Service;
 import me.cortex.voxy.common.thread.ServiceManager;
+import me.cortex.voxy.common.voxelization.CamouflageBlockCompat;
 import me.cortex.voxy.common.voxelization.ILightingSupplier;
 import me.cortex.voxy.common.voxelization.VoxelizedSection;
 import me.cortex.voxy.common.voxelization.WorldConversionFactory;
@@ -11,20 +12,32 @@ import me.cortex.voxy.common.world.WorldEngine;
 import me.cortex.voxy.common.world.WorldUpdater;
 import me.cortex.voxy.commonImpl.VoxyCommon;
 import me.cortex.voxy.commonImpl.WorldIdentifier;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
 import net.minecraft.world.level.LightLayer;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.DataLayer;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.lighting.LayerLightSectionStorage;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
+import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedDeque;
 
 public class VoxelIngestService {
     private static final ThreadLocal<VoxelizedSection> SECTION_CACHE = ThreadLocal.withInitial(VoxelizedSection::createEmpty);
     private final Service service;
-    private record IngestSection(int cx, int cy, int cz, WorldEngine world, LevelChunkSection section, DataLayer blockLight, DataLayer skyLight){}
+    //blockEntities holds a per-section snapshot of the serialized NBT of every camouflage/mimicry
+    // block entity (Framed Blocks, Create Copycat, Copycats+) in the section, taken on the calling
+    // (main) thread - see snapshotCamoBlockEntities. It's needed to resolve those blocks to their real
+    // appearance (see WorldConversionFactory#sectionMayContainCompatBlocks/convertSlow). Every ingest
+    // path must supply it: a later ingest of the same section WITHOUT it would overwrite the good
+    // camo data with the bare wrapper block again.
+    private record IngestSection(int cx, int cy, int cz, WorldEngine world, LevelChunkSection section, DataLayer blockLight, DataLayer skyLight, @Nullable Map<BlockPos, CompoundTag> blockEntities){}
     private final ConcurrentLinkedDeque<IngestSection> ingestQueue = new ConcurrentLinkedDeque<>();
 
     public VoxelIngestService(ServiceManager pool) {
@@ -41,13 +54,27 @@ public class VoxelIngestService {
         if (section.hasOnlyAir() && task.blockLight==null && task.skyLight==null) {//If the chunk section has lighting data, propagate it
             WorldUpdater.insertUpdate(task.world, vs.zero());
         } else {
-            VoxelizedSection csec = WorldConversionFactory.convert(
-                    vs,
-                    task.world.getMapper(),
-                    section.getStates(),
-                    section.getBiomes(),
-                    getLightingSupplier(task)
-            );
+            VoxelizedSection csec;
+            if (WorldConversionFactory.sectionMayContainCompatBlocks(section.getStates())) {
+                csec = WorldConversionFactory.convertSlow(
+                        vs,
+                        task.world.getMapper(),
+                        task.world.getInstanceKeyRegistry(),
+                        section.getStates(),
+                        section.getBiomes(),
+                        getLightingSupplier(task),
+                        new BlockPos(task.cx << 4, task.cy << 4, task.cz << 4),
+                        task.blockEntities
+                );
+            } else {
+                csec = WorldConversionFactory.convert(
+                        vs,
+                        task.world.getMapper(),
+                        section.getStates(),
+                        section.getBiomes(),
+                        getLightingSupplier(task)
+                );
+            }
             WorldVoxilizedSectionMipper.mipSection(csec, task.world.getMapper());
             WorldUpdater.insertUpdate(task.world, csec);
         }
@@ -88,6 +115,40 @@ public class VoxelIngestService {
         return true;
     }
 
+    //Serializes the camouflage/mimicry block entities of one chunk section on the calling thread, so
+    // the ingest worker never touches live (main-thread-mutated) block entities or the chunk's BE map.
+    // Returns null if the section has none.
+    @Nullable
+    public static Map<BlockPos, CompoundTag> snapshotCamoBlockEntities(@Nullable ChunkAccess chunk, int sectionY) {
+        if (!(chunk instanceof LevelChunk levelChunk)) {
+            return null;
+        }
+        Map<BlockPos, CompoundTag> out = null;
+        try {
+            for (var entry : levelChunk.getBlockEntities().entrySet()) {
+                BlockPos pos = entry.getKey();
+                BlockEntity be = entry.getValue();
+                if (be == null || (pos.getY() >> 4) != sectionY) continue;
+                if (!CamouflageBlockCompat.mightNeedResolve(be.getBlockState().getBlock())) continue;
+                try {
+                    //? if 1.20.1 {
+                    var nbt = be.saveWithId();
+                    //? } else {
+                    /*var nbt = be.saveWithId(net.minecraft.client.Minecraft.getInstance().level.registryAccess());*/
+                    //? }
+                    if (out == null) out = new java.util.HashMap<>();
+                    out.put(pos.immutable(), nbt);
+                } catch (Exception e) {
+                    //Keep this block's plain per-BlockState appearance
+                }
+            }
+        } catch (Exception e) {
+            //Concurrent modification of the chunk's BE map - skip camo resolution for this pass
+            return out;
+        }
+        return out;
+    }
+
     public boolean enqueueIngest(WorldEngine engine, LevelChunk chunk) {
         if (!this.service.isLive()) {
             return false;
@@ -121,7 +182,7 @@ public class VoxelIngestService {
                 i++;
                 if (section == null || !shouldIngestSection(section, chunk.getPos().x, i, chunk.getPos().z)) continue;
                 engine.markActive();
-                this.ingestQueue.add(new IngestSection(chunk.getPos().x, i, chunk.getPos().z, engine, section, null, null));
+                this.ingestQueue.add(new IngestSection(chunk.getPos().x, i, chunk.getPos().z, engine, section, null, null, snapshotCamoBlockEntities(chunk, i)));
                 try {
                     this.service.execute();
                 } catch (Exception e) {
@@ -161,7 +222,7 @@ public class VoxelIngestService {
             //    continue;
             //}
             engine.markActive();
-            this.ingestQueue.add(new IngestSection(chunk.getPos().x, i, chunk.getPos().z, engine, section, bl, sl));//TODO: fixme, this is technically not safe todo on the chunk load ingest, we need to copy the section data so it cant be modified while being read
+            this.ingestQueue.add(new IngestSection(chunk.getPos().x, i, chunk.getPos().z, engine, section, bl, sl, snapshotCamoBlockEntities(chunk, i)));//TODO: fixme, this is technically not safe todo on the chunk load ingest, we need to copy the section data so it cant be modified while being read
             try {
                 this.service.execute();
             } catch (Exception e) {
@@ -196,8 +257,8 @@ public class VoxelIngestService {
         return tryIngestChunk(WorldIdentifier.of(chunk.getLevel()), chunk);
     }
 
-    private boolean rawIngest0(WorldEngine engine, LevelChunkSection section, int x, int y, int z, DataLayer bl, DataLayer sl) {
-        this.ingestQueue.add(new IngestSection(x, y, z, engine, section, bl, sl));
+    private boolean rawIngest0(WorldEngine engine, LevelChunkSection section, int x, int y, int z, DataLayer bl, DataLayer sl, @Nullable ChunkAccess chunk) {
+        this.ingestQueue.add(new IngestSection(x, y, z, engine, section, bl, sl, snapshotCamoBlockEntities(chunk, y)));
         try {
             this.service.execute();
             return true;
@@ -207,17 +268,17 @@ public class VoxelIngestService {
         }
     }
 
-    public static boolean rawIngest(WorldIdentifier id, LevelChunkSection section, int x, int y, int z, DataLayer bl, DataLayer sl) {
+    public static boolean rawIngest(WorldIdentifier id, LevelChunkSection section, int x, int y, int z, DataLayer bl, DataLayer sl, @Nullable ChunkAccess chunk) {
         if (id == null) return false;
         var engine = id.getOrCreateEngine();
         if (engine == null) return false;
-        return rawIngest(engine, section, x, y, z, bl, sl);
+        return rawIngest(engine, section, x, y, z, bl, sl, chunk);
     }
 
-    public static boolean rawIngest(WorldEngine engine, LevelChunkSection section, int x, int y, int z, DataLayer bl, DataLayer sl) {
+    public static boolean rawIngest(WorldEngine engine, LevelChunkSection section, int x, int y, int z, DataLayer bl, DataLayer sl, @Nullable ChunkAccess chunk) {
         if (!shouldIngestSection(section, x, y, z)) return false;
         if (engine.instanceIn == null) return false;
         if (!engine.instanceIn.isIngestEnabled(null)) return false;//TODO: dont pass in null
-        return engine.instanceIn.getIngestService().rawIngest0(engine, section, x, y, z, bl, sl);
+        return engine.instanceIn.getIngestService().rawIngest0(engine, section, x, y, z, bl, sl, chunk);
     }
 }

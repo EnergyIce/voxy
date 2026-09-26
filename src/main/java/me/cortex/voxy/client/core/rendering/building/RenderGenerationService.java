@@ -4,6 +4,7 @@ import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import me.cortex.voxy.client.core.model.IdNotYetComputedException;
 import me.cortex.voxy.client.core.model.ModelBakerySubsystem;
+import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.thread.Service;
 import me.cortex.voxy.common.thread.ServiceManager;
 import me.cortex.voxy.common.util.Pair;
@@ -74,7 +75,7 @@ public class RenderGenerationService {
 
         this.service = sm.createService(()->{
             //Thread local instance of the factory
-            var factory = new RenderDataFactory(this.world, this.modelBakery.factory, this.emitMeshlets);
+            var factory = new RenderDataFactory(this.world, this.modelBakery.factory, this.modelBakery.instanceBaker, this.emitMeshlets);
             IntOpenHashSet seenMissed = new IntOpenHashSet(128);
             return new Pair<>(() -> {
                 this.processJob(factory, seenMissed);
@@ -164,7 +165,29 @@ public class RenderGenerationService {
 
         try {
             mesh = factory.generateMesh(section);
-        } catch (IdNotYetComputedException e) {
+        } catch (Exception genericException) {
+            //Guard against ANY unexpected exception (not just the expected-and-handled
+            // IdNotYetComputedException below) leaking this WorldSection forever. This used to fall
+            // straight through to the method's end without running the shouldFreeSection/release()
+            // block below, permanently leaking the section's "active" state - with e.g. exactly 2
+            // such crashes (a concurrent-map corruption bug in InstanceModelBaker, since fixed)
+            // pinning ActiveSectionTracker's loaded-cache count at 2 forever and hanging
+            // VoxyInstance#shutdown()'s wait loop on every subsequent disconnect/kick. Dropping this
+            // one job and releasing the section is a normal, recoverable failure - it'll simply be
+            // regenerated next time this section is touched - instead of wedging the whole world.
+            if (!(genericException instanceof IdNotYetComputedException)) {
+                Logger.error("Voxy: unexpected exception while generating mesh for section, dropping this job and releasing the section", genericException);
+                //Mirror the exact bookkeeping the normal-completion path below does, so
+                // holdingSectionCount (which bounds MAX_HOLDING_SECTION_COUNT) stays accurate.
+                if (shouldFreeSection) {
+                    if (task != null && task.section != null) {
+                        this.holdingSectionCount.decrementAndGet();
+                    }
+                    section.release();
+                }
+                return;
+            }
+            var e = (IdNotYetComputedException) genericException;
             {
                 long stamp = this.taskMapLock.writeLock();
                 BuildTask other = this.taskMap.putIfAbsent(task.position, task);

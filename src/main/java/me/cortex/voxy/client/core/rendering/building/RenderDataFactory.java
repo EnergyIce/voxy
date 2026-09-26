@@ -1,6 +1,7 @@
 package me.cortex.voxy.client.core.rendering.building;
 
 import me.cortex.voxy.client.core.model.IdNotYetComputedException;
+import me.cortex.voxy.client.core.model.InstanceModelBaker;
 import me.cortex.voxy.client.core.model.ModelFactory;
 import me.cortex.voxy.client.core.model.ModelQueries;
 import me.cortex.voxy.client.core.util.ScanMesher2D;
@@ -19,6 +20,12 @@ import java.util.Arrays;
 public class RenderDataFactory {
     private static final boolean BUILD_OCCUPANCY_SET = false;
 
+    //Distinguishes the two ways prepareSectionData's failure return (bit 31 set) can happen: a normal
+    // per-BlockState model not baked yet (needs requestBlockBake), or a camouflage/mimicry instance
+    // override still baking asynchronously in InstanceModelBaker (self-resolves - no bake request
+    // needed, just needs a retry once it's done). See generateMesh().
+    private static final int INSTANCE_PENDING_FLAG = 1 << 30;
+
     private static final boolean CHECK_NEIGHBOR_FACE_OCCLUSION = true;
     private static final boolean DISABLE_CULL_SAME_OCCLUDES = false;//TODO: FIX TRANSLUCENTS (e.g. stained glass) breaking on chunk boarders with this set to false (it might be something else????)
 
@@ -34,6 +41,15 @@ public class RenderDataFactory {
 
     private final WorldEngine world;
     private final ModelFactory modelMan;
+    private final InstanceModelBaker instanceBaker;
+
+    //Voxels of the current section whose (camouflage) model is stepped/layered and therefore consists of
+    // extra "plane" models on top of the primary one (see ModelPlaneSplitter). Filled by prepareSectionData,
+    // consumed by generateSecondaryPlanes.
+    private int secCount;
+    private final int[] secVoxel = new int[32*32*32];
+    private static final int MAX_EXTRA_PLANES = 4;
+    private final int[][] secModel = new int[MAX_EXTRA_PLANES][32*32*32];
 
     //private final long[] sectionData = new long[32*32*32*2];
     private final long[] sectionData = new long[32*32*32*2];
@@ -184,17 +200,32 @@ public class RenderDataFactory {
     private final Mesher blockMesher = new Mesher();
     private final Mesher seondaryblockMesher = new Mesher();//Used for dual non-opaque geometry
 
-    public RenderDataFactory(WorldEngine world, ModelFactory modelManager, boolean emitMeshlets) {
-        this(world, modelManager, emitMeshlets, false);
+    public RenderDataFactory(WorldEngine world, ModelFactory modelManager, InstanceModelBaker instanceBaker, boolean emitMeshlets) {
+        this(world, modelManager, instanceBaker, emitMeshlets, false);
     }
-    public RenderDataFactory(WorldEngine world, ModelFactory modelManager, boolean emitMeshlets, boolean generateOccupancy) {
+    public RenderDataFactory(WorldEngine world, ModelFactory modelManager, InstanceModelBaker instanceBaker, boolean emitMeshlets, boolean generateOccupancy) {
         this.world = world;
         this.modelMan = modelManager;
+        this.instanceBaker = instanceBaker;
         if (generateOccupancy && BUILD_OCCUPANCY_SET) {
             this.occupancy = new OccupancySet();
         } else {
             this.occupancy = null;
         }
+    }
+
+    //Resolves the model id to use for this raw voxel value: the per-instance baked model if one is
+    // ready (camouflage/mimicry blocks - see Mapper#hasInstanceOverride), otherwise the normal
+    // per-BlockState model. Falls back to the normal model (never blocks/throws) if the instance
+    // model isn't baked yet - see InstanceModelBaker for why that's a safe, self-healing fallback.
+    private int resolveModelId(long raw) {
+        if (Mapper.hasInstanceOverride(raw)) {
+            int instanceModelId = this.instanceBaker.getModelId(Mapper.getInstanceIndex(raw));
+            if (instanceModelId != -1) {
+                return instanceModelId;
+            }
+        }
+        return this.modelMan.getModelId(Mapper.getBlockId(raw));
     }
 
     private static long getQuadTyping(long metadata) {//2 bits
@@ -231,7 +262,36 @@ public class RenderDataFactory {
                     sectionData[i * 2 + 1] = 0;
                 } else {
                     int modelId = rawModelIds[Mapper.getBlockId(block)];
-                    if (modelId == -1) {//Failed, so just return error
+                    if (Mapper.hasInstanceOverride(block)) {
+                        //Camouflage/mimicry voxel (see CamouflageBlockCompat) - use its real, per-instance
+                        // baked model. This is resolved BEFORE requiring the wrapper's plain per-BlockState
+                        // model: the instance model fully replaces it, and demanding the plain bake first
+                        // needlessly held up (or, if that plain bake never completed, permanently blocked)
+                        // meshing of every section containing such a block.
+                        int instanceIndex = Mapper.getInstanceIndex(block);
+                        int instanceModelId = this.instanceBaker.getModelId(instanceIndex);
+                        if (instanceModelId != -1) {
+                            modelId = instanceModelId;
+                            int[] sec = this.instanceBaker.getSecondaryModelIds(instanceIndex);
+                            if (sec != null && sec.length != 0) {
+                                this.secVoxel[this.secCount] = i;
+                                for (int e = 0; e < MAX_EXTRA_PLANES; e++) {
+                                    this.secModel[e][this.secCount] = e < sec.length ? sec[e] : -1;
+                                }
+                                this.secCount++;
+                            }
+                        } else if (this.instanceBaker.isPending(instanceIndex)) {
+                            //Still baking (async, budget-limited) - throw like a not-yet-computed
+                            // blockId so this section gets retried once the bake finishes, instead of
+                            // silently locking in the plain fallback forever.
+                            return instanceIndex | (1 << 31) | INSTANCE_PENDING_FLAG;
+                        } else if (modelId == -1) {
+                            //Instance permanently failed to bake, so the plain model is needed after all
+                            return Mapper.getBlockId(block) | (1 << 31);
+                        }
+                        //else: permanently failed to bake (e.g. no camo quads produced) - keep the
+                        // plain fallback modelId already resolved above, this is a stable result.
+                    } else if (modelId == -1) {//Failed, so just return error
                         return Mapper.getBlockId(block) | (1 << 31);
                     }
                     if (modelId == 0) {//modelId == 0, its basicly air so set it as air
@@ -491,7 +551,7 @@ public class RenderDataFactory {
                         if (nib != 0) {//Not air
                             //FIXME need to use selfMeta to check for if it can be culled against this block
 
-                            int cid = this.modelMan.getModelId(nib);
+                            int cid = this.resolveModelId(neighborId);
                             long meta = this.modelMan.getModelMetadataFromClientId(cid);
                             if (ModelQueries.isFullyOpaque(meta)) {//Dont mesh this face
                                 this.blockMesher.skip(1);
@@ -664,7 +724,7 @@ public class RenderDataFactory {
 
                         //Check and test if can cull W.R.T neighbor
                         if (Mapper.getBlockId(neighborId) != 0) {//Not air
-                            int modelId = this.modelMan.getModelId(Mapper.getBlockId(neighborId));
+                            int modelId = this.resolveModelId(neighborId);
                             long meta = this.modelMan.getModelMetadataFromClientId(modelId);
                             if (ModelQueries.containsFluid(meta)) {
                                 modelId = this.modelMan.getFluidClientStateId(modelId);
@@ -799,7 +859,7 @@ public class RenderDataFactory {
                         boolean fail = false;
                         //Check and test if can cull W.R.T neighbor
                         if (Mapper.getBlockId(neighborId) != 0) {//Not air
-                            int modelId = this.modelMan.getModelId(Mapper.getBlockId(neighborId));
+                            int modelId = this.resolveModelId(neighborId);
 
 
                             if (ModelQueries.cullsSame(Am) && modelId == ((A>>26)&0xFFFF)) {//TODO: FIXME, this technically isnt correct as need to check self occulsion, thinks?
@@ -1054,7 +1114,7 @@ public class RenderDataFactory {
                     long neighborId = this.neighboringFaces[i];
                     boolean oki = true;
                     if (Mapper.getBlockId(neighborId) != 0) {//Not air
-                        long meta = this.modelMan.getModelMetadataFromClientId(this.modelMan.getModelId(Mapper.getBlockId(neighborId)));
+                        long meta = this.modelMan.getModelMetadataFromClientId(this.resolveModelId(neighborId));
                         if (ModelQueries.isFullyOpaque(meta)) {
                             oki = false;
                         } else if (CHECK_NEIGHBOR_FACE_OCCLUSION && ModelQueries.faceOccludes(meta, (2 << 1) | (1 - 0))) {
@@ -1080,7 +1140,7 @@ public class RenderDataFactory {
                     long neighborId = this.neighboringFaces[i+32*32];
                     boolean oki = true;
                     if (Mapper.getBlockId(neighborId) != 0) {//Not air
-                        long meta = this.modelMan.getModelMetadataFromClientId(this.modelMan.getModelId(Mapper.getBlockId(neighborId)));
+                        long meta = this.modelMan.getModelMetadataFromClientId(this.resolveModelId(neighborId));
                         if (ModelQueries.isFullyOpaque(meta)) {
                             oki = false;
                         } else if (CHECK_NEIGHBOR_FACE_OCCLUSION && ModelQueries.faceOccludes(meta, (2 << 1) | (1 - 1))) {
@@ -1294,7 +1354,7 @@ public class RenderDataFactory {
 
                     if (Mapper.getBlockId(neighborId) != 0) {//Not air
 
-                        int modelId = this.modelMan.getModelId(Mapper.getBlockId(neighborId));
+                        int modelId = this.resolveModelId(neighborId);
                         long meta = this.modelMan.getModelMetadataFromClientId(modelId);
                         if (ModelQueries.isFullyOpaque(meta)) {
                             oki = false;
@@ -1358,7 +1418,7 @@ public class RenderDataFactory {
 
 
                     if (Mapper.getBlockId(neighborId) != 0) {//Not air
-                        int modelId = this.modelMan.getModelId(Mapper.getBlockId(neighborId));
+                        int modelId = this.resolveModelId(neighborId);
                         long meta = this.modelMan.getModelMetadataFromClientId(modelId);
                         if (ModelQueries.isFullyOpaque(meta)) {
                             oki = false;
@@ -1569,7 +1629,7 @@ public class RenderDataFactory {
                     int modelId = 0;
                     long nM = 0;
                     if (Mapper.getBlockId(neighborId) != 0) {//Not air
-                        modelId = this.modelMan.getModelId(Mapper.getBlockId(neighborId));
+                        modelId = this.resolveModelId(neighborId);
                         nM = this.modelMan.getModelMetadataFromClientId(modelId);
                     }
 
@@ -1591,7 +1651,7 @@ public class RenderDataFactory {
                     int modelId = 0;
                     long nM = 0;
                     if (Mapper.getBlockId(neighborId) != 0) {//Not air
-                        modelId = this.modelMan.getModelId(Mapper.getBlockId(neighborId));
+                        modelId = this.resolveModelId(neighborId);
                         nM = this.modelMan.getModelMetadataFromClientId(modelId);
                     }
 
@@ -1681,6 +1741,63 @@ public class RenderDataFactory {
         }
     }
 
+    //Clears all mesher state so a further generate*Faces() pass can append to the same output buffers
+    private void resetMeshers() {
+        this.blockMesher.reset();
+        this.blockMesher.doAuxiliaryFaceOffset = true;
+        this.seondaryblockMesher.reset();
+        this.seondaryblockMesher.doAuxiliaryFaceOffset = true;
+        for (var mesher : this.xAxisMeshers) {
+            mesher.reset();
+            mesher.doAuxiliaryFaceOffset = true;
+        }
+        if (CHECK_NEIGHBOR_FACE_OCCLUSION) {
+            for (var mesher : this.secondaryXAxisMeshers) {
+                mesher.reset();
+                mesher.doAuxiliaryFaceOffset = false;
+            }
+        }
+    }
+
+    //Extra passes for stepped/layered camouflage models. Each pass meshes ONLY the voxels' n-th extra
+    // depth-plane model (everything else counts as empty), appending its quads to the same buffers as the
+    // primary pass. Faces such a plane would share with real neighbours are therefore not culled against
+    // them, which costs a few hidden quads but never removes visible ones.
+    private void generateSecondaryPlanes(final long[] raw) {
+        for (int plane = 0; plane < MAX_EXTRA_PLANES; plane++) {
+            Arrays.fill(this.opaqueMasks, 0);
+            Arrays.fill(this.nonOpaqueMasks, 0);
+            Arrays.fill(this.fluidMasks, 0);
+            //Everything is "air" (keeping its light) except the voxels that own this plane
+            for (int i = 0; i < 32*32*32; i++) {
+                this.sectionData[i * 2] = (raw[i] & (0xFFL << 56)) >>> 1;
+                this.sectionData[i * 2 + 1] = 0;
+            }
+            boolean any = false;
+            for (int k = 0; k < this.secCount; k++) {
+                int modelId = this.secModel[plane][k];
+                if (modelId < 0) continue;
+                int i = this.secVoxel[k];
+                long block = raw[i];
+                long meta = this.modelMan.getModelMetadataFromClientId(modelId);
+                this.sectionData[i * 2] = packPartialQuadData(modelId, block, meta);
+                this.sectionData[i * 2 + 1] = meta;
+                if (ModelQueries._isFullyOpaque(meta) != 0) {
+                    this.opaqueMasks[i >> 5] |= 1 << (i & 31);
+                } else {
+                    this.nonOpaqueMasks[i >> 5] |= 1 << (i & 31);
+                }
+                any = true;
+            }
+            if (!any) {
+                continue;
+            }
+            this.resetMeshers();
+            this.generateYZFaces();
+            this.generateXFaces();
+        }
+    }
+
     //section is already acquired and gets released by the parent
     public BuiltSection generateMesh(WorldSection section) {
         //TODO: FIXME: because of the exceptions that are thrown when aquiring modelId
@@ -1693,6 +1810,7 @@ public class RenderDataFactory {
         //We must reset _everything_ that could have changed as we dont exactly know the state due to how the model id exception
         // throwing system works
         this.quadCount = 0;
+        this.secCount = 0;
 
         {//Reset all the block meshes
             this.blockMesher.reset();
@@ -1729,7 +1847,10 @@ public class RenderDataFactory {
         //Prepare everything
         int neighborMskAndFlags = this.prepareSectionData(section._unsafeGetRawDataArray());
         if ((neighborMskAndFlags&(1<<31))!=0) {//We failed to get everything so throw exception
-            throw new IdNotYetComputedException(neighborMskAndFlags&((1<<20)-1), true);
+            //INSTANCE_PENDING_FLAG means this isn't a blockId at all (it's an instance index) - don't
+            // treat it as isIdBlockId, so the retry path doesn't call requestBlockBake on it.
+            boolean isInstancePending = (neighborMskAndFlags & INSTANCE_PENDING_FLAG) != 0;
+            throw new IdNotYetComputedException(neighborMskAndFlags&((1<<20)-1), !isInstancePending);
         }
         int neighborMsk = neighborMskAndFlags&0b11_11_11;
         int flags = neighborMskAndFlags>>>6;
@@ -1740,6 +1861,9 @@ public class RenderDataFactory {
         try {
             this.generateYZFaces();
             this.generateXFaces();
+            if (this.secCount != 0) {
+                this.generateSecondaryPlanes(section._unsafeGetRawDataArray());
+            }
         } catch (IdNotYetComputedException e) {
             e.auxBitMsk = neighborMsk;
             e.auxData = this.neighboringFaces;
