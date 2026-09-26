@@ -43,10 +43,11 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 // per-BlockState appearance, which is always a safe, existing fallback (never a crash or garbage).
 public class InstanceModelBaker {
     private static final int SIZE = ModelFactory.MODEL_TEXTURE_SIZE;
-    //Top of the 16-bit model id space (see ModelStore/quad_format.glsl - model id is a 16 bit field)
-    // reserved for instance models, leaving the rest to ModelFactory's normal per-BlockState models.
-    private static final int RESERVED_COUNT = 8192;
-    private static final int FIRST_RESERVED_ID = (1 << 16) - RESERVED_COUNT;
+    //Instance models share the 16-bit model id space (see ModelStore/quad_format.glsl - model id is a 16 bit field;
+    // buffers and texture atlas are sized for all 65536) with ModelFactory's normal per-BlockState models. Normal
+    // models take ids from 0 upwards, instance models from the top downwards. NORMAL_HEADROOM ids above the normal
+    // models baked so far are always kept free for normal models that still appear later.
+    private static final int NORMAL_HEADROOM = 8192;
 
     //Budget for how many instance bakes to attempt per frame.
     public static final int DEFAULT_BUDGET_PER_FRAME = 4;
@@ -81,7 +82,8 @@ public class InstanceModelBaker {
     // per secondary id. Guarded by lock like resolved.
     private final java.util.HashMap<Integer, int[]> secondary = new java.util.HashMap<>();
 
-    private int nextModelId = FIRST_RESERVED_ID;
+    //Next (highest) free instance model id; allocation goes downwards
+    private int nextTopId = (1 << 16) - 1;
     private boolean loggedExhausted = false;
 
     //Base class of every Create (and Create addon, incl. Copycats+) block entity; its handleUpdateTag reads the same
@@ -100,7 +102,8 @@ public class InstanceModelBaker {
     public InstanceModelBaker(ModelFactory modelFactory) {
         this.modelFactory = modelFactory;
         this.resolved.defaultReturnValue(-2);//-2 = "no entry" (distinct from -1 "permanently failed")
-        this.bakery.setupTexture();
+        //Shares ModelFactory's CPU copy of the block atlas instead of reading it back from the GPU again
+        this.bakery.shareTextureFrom(modelFactory.bakery2);
     }
 
     //Callable from any thread (section mesh generation workers). Returns -1 if not ready/available
@@ -173,6 +176,19 @@ public class InstanceModelBaker {
         }
     }
 
+    private boolean canAllocateIds(int count) {
+        return this.nextTopId - count + 1 > this.modelFactory.getBakedCount() + NORMAL_HEADROOM;
+    }
+
+    //Allocates count consecutive instance model ids and returns the lowest, or -1 if the space is used up
+    private int allocateIds(int count) {
+        if (!this.canAllocateIds(count)) return -1;
+        int lowest = this.nextTopId - count + 1;
+        this.nextTopId = lowest - 1;
+        this.modelFactory.setInstanceIdFloor(lowest);
+        return lowest;
+    }
+
     private static ColourDepthTextureData[] readFaces(long ptr) {
         var textureData = new ColourDepthTextureData[6];
         final int FACE_SIZE = SIZE * SIZE;
@@ -242,10 +258,10 @@ public class InstanceModelBaker {
             return;
         }
 
-        if (this.nextModelId >= (1 << 16)) {
+        if (!this.canAllocateIds(1)) {
             if (!this.loggedExhausted) {
                 this.loggedExhausted = true;
-                Logger.warn("Voxy: camouflage instance model capacity (" + RESERVED_COUNT + ") exhausted this session, further instances will show their plain block appearance");
+                Logger.warn("Voxy: camouflage instance model capacity exhausted this session (" + ((1 << 16) - 1 - this.nextTopId) + " instance models, " + this.modelFactory.getBakedCount() + " normal models), further instances will show their plain block appearance");
             }
             this.setResolved(instanceIndex, -1);
             return;
@@ -339,18 +355,19 @@ public class InstanceModelBaker {
             if (oPlanes == null) oPlanes = new ColourDepthTextureData[][]{opaqueTex};
             if (tPlanes == null) tPlanes = new ColourDepthTextureData[][]{translTex};
             int total = oPlanes.length + tPlanes.length;
-            if (this.nextModelId + total <= (1 << 16)) {
+            int base = this.allocateIds(total);
+            if (base != -1) {
                 int doubleSided = ModelFactory.instanceNeedsDoubleSided(textureData, RenderType.translucent()) ? 1 : 0;
                 int fullyOpaque = -1;
                 int[] ids = new int[total];
                 int n = 0;
                 for (var tex : oPlanes) {
-                    ids[n] = this.nextModelId++;
+                    ids[n] = base + n;
                     this.modelFactory.enqueueUpload(this.modelFactory.buildInstanceModelUpload(ids[n], key.wrapperState(), tex, isShaded, hasDarkenedTextures, chooseOpaqueLayer(tex, isLeaves), doubleSided, fullyOpaque));
                     n++;
                 }
                 for (var tex : tPlanes) {
-                    ids[n] = this.nextModelId++;
+                    ids[n] = base + n;
                     this.modelFactory.enqueueUpload(this.modelFactory.buildInstanceModelUpload(ids[n], key.wrapperState(), tex, isShaded, hasDarkenedTextures, RenderType.translucent(), doubleSided, -1));
                     n++;
                 }
@@ -361,14 +378,15 @@ public class InstanceModelBaker {
             }
         }
         var planes = !solidCube ? ModelPlaneSplitter.split(textureData) : null;
-        if (planes != null && this.nextModelId + planes.length <= (1 << 16)) {
+        int planesBase = planes != null ? this.allocateIds(planes.length) : -1;
+        if (planesBase != -1) {
             //Stepped/layered model: one Voxy model per depth plane (nearest first), primary + secondaries
             int[] ids = new int[planes.length];
             //Double-sidedness is a property of the whole block, not of one plane (see instanceNeedsDoubleSided)
             int doubleSided = ModelFactory.instanceNeedsDoubleSided(textureData, chooseLayer(textureData, anyTranslucentQuads, anyDiscardQuads, isLeaves)) ? 1 : 0;
             int fullyOpaque = -1;
             for (int plane = 0; plane < planes.length; plane++) {
-                ids[plane] = this.nextModelId++;
+                ids[plane] = planesBase + plane;
                 var layer = chooseLayer(planes[plane], anyTranslucentQuads, anyDiscardQuads, isLeaves);
                 this.modelFactory.enqueueUpload(this.modelFactory.buildInstanceModelUpload(ids[plane], key.wrapperState(), planes[plane], isShaded, hasDarkenedTextures, layer, doubleSided, fullyOpaque));
             }
@@ -376,7 +394,11 @@ public class InstanceModelBaker {
             this.setSecondary(instanceIndex, java.util.Arrays.copyOfRange(ids, 1, ids.length));
             modelId = ids[0];
         } else {
-            modelId = this.nextModelId++;
+            modelId = this.allocateIds(1);
+            if (modelId == -1) {
+                this.setResolved(instanceIndex, -1);
+                return;
+            }
             var layer = chooseLayer(textureData, anyTranslucentQuads, anyDiscardQuads, isLeaves);
             this.modelFactory.enqueueUpload(this.modelFactory.buildInstanceModelUpload(modelId, key.wrapperState(), textureData, isShaded, hasDarkenedTextures, layer));
         }

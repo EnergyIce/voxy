@@ -59,6 +59,22 @@ public class SoftwareRasterizer {
         this.doTheBlending = blending;
     }
 
+    //Tint colours (0xRRGGBB) of tint groups 1..n, indexed by group-1. A vertex metadata tint group (bits 8-15, 0 = none)
+    // multiplies the sampled texture colour with that group's colour before blending - used to bake BlockColor tints
+    // whose colour depends on per-instance data (e.g. a painted road's colour stored in its block entity).
+    private int[] tintTable;
+
+    public void setTintTable(int[] tintTable) {
+        this.tintTable = tintTable;
+    }
+
+    private static int applyTint(int abgr, int rgb) {
+        int r = ((abgr & 0xFF) * ((rgb >>> 16) & 0xFF) + 127) / 255;
+        int g = (((abgr >>> 8) & 0xFF) * ((rgb >>> 8) & 0xFF) + 127) / 255;
+        int b = (((abgr >>> 16) & 0xFF) * (rgb & 0xFF) + 127) / 255;
+        return (abgr & 0xFF000000) | (b << 16) | (g << 8) | r;
+    }
+
     public void setSamplerTexture(int[] texture, int width, int height) {
         if (texture.length != width*height) throw new IllegalArgumentException();
         this.samplerTexture = texture;
@@ -174,6 +190,10 @@ public class SoftwareRasterizer {
         float v = Math.fma(b1, this.a1.z, Math.fma(b2, this.a2.z, b3 * this.a3.z));
 
         int colour = this.sampleTexture(u,v);//The ABGR colour of this pixel
+        int tintGroup = (meta >>> 8) & 0xFF;
+        if (tintGroup != 0 && this.tintTable != null && tintGroup <= this.tintTable.length) {
+            colour = applyTint(colour, this.tintTable[tintGroup - 1]);
+        }
 
 
         final int ALPHA_CUTOFF_THRESHOLD = 0;

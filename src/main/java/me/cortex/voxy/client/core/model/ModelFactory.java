@@ -618,6 +618,10 @@ public class ModelFactory {
                 return null;
             } else {//Not a duplicate so create a new entry
                 modelId = this.modelTexture2id.size();
+                if (modelId >= this.instanceIdFloor && !this.loggedIdCollision) {
+                    this.loggedIdCollision = true;
+                    Logger.error("Voxy: normal block models (" + modelId + ") reached the camouflage instance model range (" + this.instanceIdFloor + "), some distant blocks may show wrong textures until restart");
+                }
                 //NOTE: we set the mapping at the very end so that race conditions with this and getMetadata dont occur
                 //this.idMappings[blockId] = modelId;
                 this.modelTexture2id.put(entry, modelId);
@@ -1166,6 +1170,15 @@ public class ModelFactory {
 
     public int getBakedCount() {
         return this.modelTexture2id.size();
+    }
+
+    //Lowest model id handed out to instance models (see InstanceModelBaker, which allocates from the top of the id
+    // space downwards and always keeps a large headroom above the normal models). Only used as a safety check.
+    private volatile int instanceIdFloor = 1 << 16;
+    private boolean loggedIdCollision = false;
+
+    public void setInstanceIdFloor(int floor) {
+        this.instanceIdFloor = floor;
     }
 
     public int getInflightCount() {

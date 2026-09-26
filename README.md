@@ -24,6 +24,7 @@ If you don't have Java 21 installed yet, get it for example from [Eclipse Temuri
 ## What's different in this rework
 
 - **Camouflage blocks in the LoD:** Framed Blocks, Create Copycats and Copycats+ are rendered with their real material instead of the empty frame / bare copycat. Stairs, slopes, bytes, layers and mixed glass/solid blocks are approximated as closely as Voxy's model format allows.
+- **TrafficCraft painted roads in the LoD:** painted asphalt and concrete (blocks and slopes) show their real road markings in their real paint colour instead of black.
 - **Distant Horizons import** supports DH's newer `DataFormatVersion 2` databases (`/voxy import distant_horizons`).
 
 ## Building from source

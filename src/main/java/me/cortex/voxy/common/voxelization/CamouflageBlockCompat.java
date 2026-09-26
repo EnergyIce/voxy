@@ -25,6 +25,7 @@ public class CamouflageBlockCompat {
     private static Class<?> framedBlockEntityClass;
     private static Class<?> copycatBlockClass;
     private static Class<?> copycatsPlusBlockClass;
+    private static Class<?> trafficCraftRoadBlockClass;
 
     private static synchronized void init() {
         if (initialized) return;
@@ -56,6 +57,17 @@ public class CamouflageBlockCompat {
             copycatsPlusBlockClass = null;
             Logger.warn("Voxy: Copycats+ instance-render compat unavailable (" + e + ")");
         }
+
+        //TrafficCraft painted roads (asphalt/concrete, full blocks and slopes, one block per paint pattern).
+        // The paint colour lives in their block entity and is applied through a BlockColor tint, so the plain
+        // per-BlockState bake can only produce black markings. Unpainted asphalt/concrete is a plain block
+        // (not a RoadBlock) and stays on the normal fast path.
+        try {
+            trafficCraftRoadBlockClass = Class.forName("de.mrjulsen.trafficcraft.block.data.RoadBlock");
+            Logger.info("Voxy: TrafficCraft painted road instance-render compat enabled");
+        } catch (ReflectiveOperationException e) {
+            trafficCraftRoadBlockClass = null;
+        }
     }
 
     //Cheap pre-check usable on a bare BlockState (e.g. while scanning a section's palette),
@@ -66,6 +78,9 @@ public class CamouflageBlockCompat {
             return true;
         }
         if (copycatsPlusBlockClass != null && copycatsPlusBlockClass.isInstance(block)) {
+            return true;
+        }
+        if (trafficCraftRoadBlockClass != null && trafficCraftRoadBlockClass.isInstance(block)) {
             return true;
         }
         if (framedBlockEntityClass != null) {

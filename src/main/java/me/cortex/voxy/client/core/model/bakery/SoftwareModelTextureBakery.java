@@ -102,7 +102,28 @@ public class SoftwareModelTextureBakery {
         int[] pixels = new int[width * height];
         glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
 
+        this.atlasPixels = pixels;
+        this.atlasWidth = width;
+        this.atlasHeight = height;
         this.rasterizer.setSamplerTexture(pixels, width, height);
+    }
+
+    //CPU copy of the block atlas read by setupTexture(); only ever read after that
+    private int[] atlasPixels;
+    private int atlasWidth;
+    private int atlasHeight;
+
+    //Use another bakery's atlas copy instead of reading the (in large modpacks 256MB+) block atlas back from the GPU
+    // a second time. Safe to share between threads: the pixels are only read.
+    public void shareTextureFrom(SoftwareModelTextureBakery other) {
+        if (other.atlasPixels == null) {
+            this.setupTexture();
+            return;
+        }
+        this.atlasPixels = other.atlasPixels;
+        this.atlasWidth = other.atlasWidth;
+        this.atlasHeight = other.atlasHeight;
+        this.rasterizer.setSamplerTexture(this.atlasPixels, this.atlasWidth, this.atlasHeight);
     }
 
     private void bakeBlockModel(BlockState state, RenderType layer) {
@@ -137,6 +158,44 @@ public class SoftwareModelTextureBakery {
     }
 
     //? if forge || neoforge {
+    //Per-bake tint resolution for instance bakes: BlockColor tints evaluated against the isolated single-block world
+    // (so handlers that read the block entity - painted roads, camouflage blocks forwarding to their material - get
+    // the real per-instance colour). Each distinct resolved colour becomes a rasterizer tint group.
+    private BlockAndTintGetter tintLevel;
+    private final int[] tintColours = new int[255];
+    private int tintCount;
+    private final java.util.HashMap<Integer, Integer> tintGroupByIndex = new java.util.HashMap<>();
+
+    //Tint group (1..255) for a quad's tint index, or 0 = leave the quad untinted. Untinted when there is no block
+    // entity context, or the handler has no real answer: -1/white (no tint, or a biome colour we can't resolve in
+    // the isolated world) and 0 (e.g. "no colour data found").
+    private int tintGroupFor(BlockState state, int tintIndex) {
+        if (this.tintLevel == null) return 0;
+        var cached = this.tintGroupByIndex.get(tintIndex);
+        if (cached != null) return cached;
+        int group = 0;
+        try {
+            int colour = Minecraft.getInstance().getBlockColors().getColor(state, this.tintLevel, BlockPos.ZERO, tintIndex);
+            int rgb = colour & 0xFFFFFF;
+            if (colour != 0 && rgb != 0xFFFFFF) {
+                for (int i = 0; i < this.tintCount; i++) {
+                    if (this.tintColours[i] == rgb) {
+                        group = i + 1;
+                        break;
+                    }
+                }
+                if (group == 0 && this.tintCount < this.tintColours.length) {
+                    this.tintColours[this.tintCount++] = rgb;
+                    group = this.tintCount;
+                }
+            }
+        } catch (Exception e) {
+            Logger.error("Voxy: block colour handler threw for " + state + " (tint " + tintIndex + "), baking it untinted", e);
+        }
+        this.tintGroupByIndex.put(tintIndex, group);
+        return group;
+    }
+
     private void bakeBlockModelWithData(BlockState state, RenderType layer, ModelData modelData) {
         if (state.getRenderShape() == RenderShape.INVISIBLE) {
             return;// Dont bake if invisible
@@ -157,8 +216,9 @@ public class SoftwareModelTextureBakery {
                 continue;
             }
             for (var quad : quads) {
+                int tintGroup = quad.isTinted() ? this.tintGroupFor(state, quad.getTintIndex()) : 0;
                 (layer == RenderType.translucent() ? this.translucentVC : this.opaqueVC)
-                        .quad(quad, state.is(BlockTags.LEAVES), layer);
+                        .quad(quad, state.is(BlockTags.LEAVES), layer, tintGroup << 8);
             }
         }
     }
@@ -254,11 +314,15 @@ public class SoftwareModelTextureBakery {
 
         this.opaqueVC.reset();
         this.translucentVC.reset();
+        this.tintLevel = blockEntity != null ? new IsolatedBlockGetter(state, blockEntity) : null;
+        this.tintCount = 0;
+        this.tintGroupByIndex.clear();
+        this.rasterizer.setTintTable(this.tintColours);
 
         var model = Minecraft.getInstance().getModelManager().getBlockModelShaper().getBlockModel(state);
         if (blockEntity != null) {
             try {
-                modelData = model.getModelData(new IsolatedBlockGetter(state, blockEntity), BlockPos.ZERO, state, modelData);
+                modelData = model.getModelData(this.tintLevel, BlockPos.ZERO, state, modelData);
             } catch (Exception e) {
                 Logger.error("Voxy: a block model threw while gathering model data for " + state + ", baking with the block entity's own data only", e);
             }
@@ -344,6 +408,7 @@ public class SoftwareModelTextureBakery {
         }
 
         boolean anyOpaque = !this.opaqueVC.isEmpty();
+        this.tintLevel = null;//Don't keep the detached block entity alive between bakes
         return (isAnyShaded ? 1 : 0) | (isAnyDarkend ? 2 : 0) | (anyTranslucent ? 4 : 0) | (anyDiscard ? 8 : 0) | (hadAnyQuads ? 16 : 0) | (anyOpaque ? 32 : 0);
     }
     //?}
