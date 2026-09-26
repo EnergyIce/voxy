@@ -12,6 +12,15 @@ Voxy is an LoD rendering mod for Minecraft. This is a reworked build of the mult
 
 The mod ID is unchanged (`voxy`), so existing Voxy configs and LoD data keep working.
 
+## ⚠️ Your game / modpack must run on Java 21
+
+Voxy is built for **Java 21**, so the Minecraft instance (or modpack) you install it into has to be started with **Java 21 or newer**.
+
+- **Minecraft 1.21.1:** already uses Java 21 by default, nothing to do.
+- **Minecraft 1.20.1:** launchers and modpacks usually run 1.20.1 on **Java 17** - with Voxy installed the game will then crash on startup, typically with an `UnsupportedClassVersionError` mentioning `class file version 65.0`. Switch the instance to Java 21 in your launcher's instance/Java settings (e.g. Modrinth App, Prism Launcher, MultiMC, CurseForge all let you pick the Java installation per instance or globally). Forge 1.20.1 and Fabric 1.20.1 both run fine on Java 21.
+
+If you don't have Java 21 installed yet, get it for example from [Eclipse Temurin 21](https://adoptium.net/temurin/releases/?version=21).
+
 ## What's different in this rework
 
 - **Camouflage blocks in the LoD:** Framed Blocks, Create Copycats and Copycats+ are rendered with their real material instead of the empty frame / bare copycat. Stairs, slopes, bytes, layers and mixed glass/solid blocks are approximated as closely as Voxy's model format allows.
