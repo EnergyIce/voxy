@@ -25,8 +25,6 @@ If you don't have Java 21 installed yet, get it for example from [Eclipse Temuri
 
 - **Camouflage blocks in the LoD:** Framed Blocks, Create Copycats and Copycats+ are rendered with their real material instead of the empty frame / bare copycat. Stairs, slopes, bytes, layers and mixed glass/solid blocks are approximated as closely as Voxy's model format allows.
 - **TrafficCraft blocks in the LoD:** painted asphalt and concrete (blocks and slopes) show their real road markings, and barriers, guardrails, cones, bollards, barrels, barrier fences, reflectors, traffic lights, street/house number signs and paint buckets show their real colour instead of black. Traffic light lamps and sign text are drawn live by TrafficCraft's own renderers and are not part of the LoD.
-
-> **LoD data from older versions:** unpainted TrafficCraft blocks are fixed immediately. Blocks with a custom paint colour (and camouflage blocks) that were stored in the LoD by an older version only get their real appearance once the area is loaded again (fly there once).
 - **Distant Horizons import** supports DH's newer `DataFormatVersion 2` databases (`/voxy import distant_horizons`).
 
 ## Building from source
