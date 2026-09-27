@@ -99,6 +99,15 @@ final class ModelPlaneSplitter {
     // angle it fills the gap where the step riser would be - without it a sloped face turned into see-through
     // slats. Must be false for translucent layers (overlapping glass would be blended twice).
     static ColourDepthTextureData[][] split(ColourDepthTextureData[] tex, int maxPlanes, boolean extendBands) {
+        return split(tex, maxPlanes, extendBands, 0);
+    }
+
+    //lip: every plane is also drawn over the pixels of deeper planes within this many texels of its own pixels, at its
+    // own depth and with their own colour ("lip"). Seen head-on the nearer plane shows exactly the colour that was
+    // there, so nothing changes; seen at an angle it covers the riser between two steps. The staircases of two
+    // perpendicular faces are cut independently, so their steps don't always meet - without the lip a grazing view
+    // slips through between a step of one face and the step edge of the other.
+    static ColourDepthTextureData[][] split(ColourDepthTextureData[] tex, int maxPlanes, boolean extendBands, int lip) {
         maxPlanes = Math.max(1, Math.min(maxPlanes, MAX_PLANES));
         final int gap = (int) Math.round(MIN_GAP * DEPTH_MAX);
         final int slopeRange = (int) Math.round(SLOPE_MIN_RANGE * DEPTH_MAX);
@@ -108,6 +117,8 @@ final class ModelPlaneSplitter {
         final int[][] depthOut = new int[6][];
         //Last plane each pixel is drawn into (== its own plane unless extended as a shingle)
         final int[][] lastPlaneOf = new int[6][];
+        //First (nearest) plane each pixel is drawn into (== its own plane unless covered by the lip of a nearer plane)
+        final int[][] firstPlaneOf = new int[6][];
         int planes = 1;
 
         for (int face = 0; face < 6; face++) {
@@ -118,6 +129,7 @@ final class ModelPlaneSplitter {
             int[] p = new int[n];
             Arrays.fill(p, -1);
             planeOf[face] = p;
+            firstPlaneOf[face] = p;
             int[] dOut = depth.clone();
             depthOut[face] = dOut;
             int[] lastP = new int[n];
@@ -290,6 +302,25 @@ final class ModelPlaneSplitter {
                 lastP[i] = extendBands ? target.firstPlane + target.bands - 1 : p[i];
             }
             planes = Math.max(planes, next);
+
+            int[] firstP = p.clone();
+            if (lip > 0) {
+                final int height = src.height();
+                for (int i = 0; i < n; i++) {
+                    if (p[i] < 0) continue;
+                    int x = i % width, y = i / width;
+                    for (int dy = -lip; dy <= lip; dy++) {
+                        for (int dx = -lip; dx <= lip; dx++) {
+                            if (Math.abs(dx) + Math.abs(dy) > lip) continue;
+                            int nx = x + dx, ny = y + dy;
+                            if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+                            int j = ny * width + nx;
+                            if (p[j] >= 0 && p[j] < firstP[i]) firstP[i] = p[j];
+                        }
+                    }
+                }
+            }
+            firstPlaneOf[face] = firstP;
         }
 
         if (planes <= 1) {
@@ -305,6 +336,7 @@ final class ModelPlaneSplitter {
                 Arrays.fill(depth, CLEARED_DEPTH_WORD);
                 int[] p = planeOf[face];
                 int[] lastP = lastPlaneOf[face];
+                int[] firstP = firstPlaneOf[face];
                 //Mean depth of this plane's own pixels: extended (shingle) pixels are placed at it, so they don't
                 // change the plane's computed depth
                 long sum = 0;
@@ -319,7 +351,7 @@ final class ModelPlaneSplitter {
                     if (p[i] == plane) {
                         colour[i] = src.colour()[i];
                         depth[i] = depthOut[face][i];
-                    } else if (cnt != 0 && p[i] >= 0 && p[i] < plane && plane <= lastP[i]) {
+                    } else if (cnt != 0 && p[i] >= 0 && ((p[i] < plane && plane <= lastP[i]) || (firstP[i] <= plane && plane < p[i]))) {
                         colour[i] = src.colour()[i];
                         depth[i] = ((int) (sum / cnt) << 8) | (depthOut[face][i] & 0xFF);
                     }

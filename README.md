@@ -25,6 +25,10 @@ If you don't have Java 21 installed yet, get it for example from [Eclipse Temuri
 
 - **Camouflage blocks in the LoD:** Framed Blocks, Create Copycats and Copycats+ are rendered with their real material instead of the empty frame / bare copycat. Stairs, slopes, bytes, layers and mixed glass/solid blocks are approximated as closely as Voxy's model format allows.
 - **TrafficCraft blocks in the LoD:** painted asphalt and concrete (blocks and slopes) show their real road markings, and barriers, guardrails, cones, bollards, barrels, barrier fences, reflectors, traffic lights, street/house number signs and paint buckets show their real colour instead of black. Traffic light lamps and sign text are drawn live by TrafficCraft's own renderers and are not part of the LoD.
+- **No more invisible chunks at the edge of the render distance:** the LoD is now hidden exactly where Embeddium/Sodium really draws chunks (per pixel, using its own render distance rules), instead of an approximation that left holes along the border and next to chunks that were still loading.
+- **Sloped blocks in the LoD:** blocks with tilted surfaces - e.g. all Macaw's Roofs roofs (normal, steep, lower, top, corners, attic roofs, awnings) - are rendered as a fine, closed staircase that follows the real slope, instead of stacked cubes with see-through gaps between the roof rows. Framed Blocks / Copycats+ slopes get the same treatment.
+- **Create: Pantographs and Wires in the LoD:** masts, brackets, insulators, tensioning devices and cantilevers (with their real configured shape) are now visible. Only the part of a cantilever arm inside its own block is shown; wires and pantographs are not part of the LoD.
+- **No error messages on screen:** Voxy errors are only written to the log, no more white text in the action bar.
 - **Distant Horizons import** supports DH's newer `DataFormatVersion 2` databases (`/voxy import distant_horizons`).
 
 ## Building from source
@@ -72,7 +76,7 @@ All finished jars are collected in:
 build/libs/<mod version>/
 ```
 
-for example `build/libs/0.2.15-beta-rework.3/`. Each variant's jar is also in its own folder:
+for example `build/libs/0.2.15-beta-rework.5/`. Each variant's jar is also in its own folder:
 
 | Variant | Output folder | Jar name |
 |---------|---------------|----------|

@@ -4,6 +4,7 @@ import me.cortex.voxy.client.ICheekyClientChunkCache;
 import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
 import me.cortex.voxy.client.core.VoxyRenderSystem;
+import me.cortex.voxy.client.core.rendering.ChunkBoundRenderer;
 import me.cortex.voxy.common.world.service.VoxelIngestService;
 import me.cortex.voxy.commonImpl.VoxyCommon;
 import net.caffeinemc.mods.sodium.client.gl.device.CommandList;
@@ -27,6 +28,7 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.Redirect;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 @Mixin(value = RenderSectionManager.class, remap = false)
 public class MixinRenderSectionManager {
@@ -50,6 +52,13 @@ public class MixinRenderSectionManager {
             }
         }
         this.bottomSectionY = this.level.getMinBuildHeight()>>4;
+    }
+
+    //The distance sodium really culls sections at (smaller than the render distance with fog occlusion in e.g. water),
+    // so the LoD masking matches what sodium draws
+    @Inject(method = "getSearchDistance", at = @At("RETURN"), require = 0)
+    private void voxy$captureSearchDistance(CallbackInfoReturnable<Float> cir) {
+        ChunkBoundRenderer.setSodiumSearchDistance(cir.getReturnValueF());
     }
 
     @Inject(method = "onChunkRemoved", at = @At("HEAD"))
@@ -91,6 +100,26 @@ public class MixinRenderSectionManager {
         }
     }*/
 
+    //Every section sodium has built (including empty ones, it draws "nothing" there) is masked out of the LoDs
+    @Unique
+    private void voxy$updateVanillaMask(RenderSection instance, boolean wasBuilt) {
+        VoxyRenderSystem system = ((IGetVoxyRenderSystem) (this.level.levelRenderer)).voxy$getRenderSystem();
+        if (system == null) return;
+        int x = instance.getChunkX(), y = instance.getChunkY(), z = instance.getChunkZ();
+        //Do some very cheeky stuff for MiB
+        if (VoxyCommon.IS_MINE_IN_ABYSS) {
+            int sector = (x+512)>>10;
+            x-=sector<<10;
+            y+=16+(256-32-sector*30);
+        }
+        long pos = SectionPos.asLong(x,y,z);
+        if (wasBuilt) {
+            system.chunkBoundRenderer.removeSection(pos);
+        } else {
+            system.chunkBoundRenderer.addSection(pos);
+        }
+    }
+
     @Unique private long cachedChunkPos = -1;
     @Unique private int cachedChunkStatus;
     @Unique private int bottomSectionY;
@@ -110,7 +139,11 @@ public class MixinRenderSectionManager {
     voxy$updateOnUpload(RenderSection instance, BuiltSectionInfo info) {
         boolean wasBuilt = instance.getFlags() != 0;
         int flags = instance.getFlags();
+        boolean wasMeshed = instance.isBuilt();
         instance.setInfo(info);
+        if (wasMeshed != instance.isBuilt()) {
+            this.voxy$updateVanillaMask(instance, wasMeshed);
+        }
         if (wasBuilt == (instance.getFlags() != 0)) { // Only want to do stuff on change
             //? if 1.21.1 {
             return true;
@@ -165,21 +198,6 @@ public class MixinRenderSectionManager {
                     VoxelIngestService.rawIngest(system.getEngine(), section, x, y, z, blp == null ? null : blp.copy(), slp == null ? null : slp.copy(), chunk);
                 }
             }
-        }
-
-        //Do some very cheeky stuff for MiB
-        if (VoxyCommon.IS_MINE_IN_ABYSS) {
-            int sector = (x+512)>>10;
-            x-=sector<<10;
-            y+=16+(256-32-sector*30);
-        }
-        long pos = SectionPos.asLong(x,y,z);
-        if (wasBuilt) {//Remove
-            //TODO: on chunk remove do ingest if is surrounded by built chunks (or when the tracker says is ok)
-
-            system.chunkBoundRenderer.removeSection(pos);
-        } else {//Add
-            system.chunkBoundRenderer.addSection(pos);
         }
         //? if 1.21.1 {
         return true;

@@ -59,6 +59,15 @@ public class SoftwareRasterizer {
         this.doTheBlending = blending;
     }
 
+    //Geometry in front of the face (outside the block on the viewer's side) is flattened onto the face instead of being
+    // dropped. Sloped models (tilted roof plates) overhang their block; clipped, the LoD staircase has a gap exactly
+    // where the neighbouring block's surface continues.
+    private boolean clampNear;
+
+    public void setClampNear(boolean clampNear) {
+        this.clampNear = clampNear;
+    }
+
     //Tint colours (0xRRGGBB) of tint groups 1..n, indexed by group-1. A vertex metadata tint group (bits 8-15, 0 = none)
     // multiplies the sampled texture colour with that group's colour before blending - used to bake BlockColor tints
     // whose colour depends on per-instance data (e.g. a painted road's colour stored in its block entity).
@@ -179,7 +188,7 @@ public class SoftwareRasterizer {
     private void rasterPixel(int index, float b1, float b2, float b3) {//Barry coords
         float z = Math.fma(b1, this.scratchR1.z, Math.fma(b2, this.scratchR2.z, b3 * this.scratchR3.z));
         z = Math.fma(z,0.5f,0.5f);
-        if (z<0.0f && -0.000001f<=z) z = 0;//Clamp to 0 if its really small negative
+        if (z<0.0f && (this.clampNear || -0.000001f<=z)) z = 0;//Clamp to 0 if its really small negative (or clamping overhangs)
         if (z<0.0f||z>1.0f)
             return;//TODO: check this
 

@@ -118,6 +118,10 @@ public class InstanceKeyRegistry {
             out.remove("LastRefreshed");
             out.remove("TrainStops");
         }
+        if (out.getString("id").startsWith("pantographsandwires:")) {
+            //Wire network node id: unique per connector and irrelevant for the model (the cantilever shape only)
+            out.remove("NodeId");
+        }
         return out;
     }
 

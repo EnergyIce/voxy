@@ -68,11 +68,24 @@ public class ModelFactory {
 
     //TODO: replace the fluid BlockState with a client model id integer of the fluidState, requires looking up
     // the fluid state in the mipper
-    private record ModelEntry(ColourDepthTextureData down, ColourDepthTextureData up, ColourDepthTextureData north, ColourDepthTextureData south, ColourDepthTextureData west, ColourDepthTextureData east, int fluidBlockStateId, int tintingColour) {
-        public ModelEntry(ColourDepthTextureData[] textures, int fluidBlockStateId, int tintingColour) {
-            this(textures[0], textures[1], textures[2], textures[3], textures[4], textures[5], fluidBlockStateId, tintingColour);
+    //variant keeps models built differently from the same textures apart: VARIANT_NORMAL, VARIANT_SPLIT (primary of a
+    // model split into depth planes, keyed by the unsplit textures) and VARIANT_PLANE+doubleSided (its extra planes)
+    private record ModelEntry(ColourDepthTextureData down, ColourDepthTextureData up, ColourDepthTextureData north, ColourDepthTextureData south, ColourDepthTextureData west, ColourDepthTextureData east, int fluidBlockStateId, int tintingColour, int variant) {
+        public ModelEntry(ColourDepthTextureData[] textures, int fluidBlockStateId, int tintingColour, int variant) {
+            this(textures[0], textures[1], textures[2], textures[3], textures[4], textures[5], fluidBlockStateId, tintingColour, variant);
         }
     }
+    private static final int VARIANT_NORMAL = 0;
+    private static final int VARIANT_SPLIT = 1;
+    private static final int VARIANT_PLANE = 2;
+    //Lip (texels) of the planes of a split sloped model, see ModelPlaneSplitter#split. Its two perpendicular staircases
+    // (e.g. roof top and roof side) are cut independently; 2 texels closes the gaps between them for Macaw's roofs from
+    // every viewing angle (1 still leaves some for the shallow roofs).
+    static final int SLOPED_PLANE_LIP = 2;
+
+    //Extra depth-plane models of a split normal model (see ModelPlaneSplitter), indexed by the primary model id.
+    // Written before the block id mapping is published, so the mesher never sees a primary without them.
+    private final int[][] secondaryModelIds = new int[1<<16][];
 
     private final Biome DEFAULT_BIOME = Minecraft.getInstance().level.registryAccess().lookupOrThrow(Registries.BIOME).getOrThrow(Biomes.PLAINS).value();
 
@@ -212,13 +225,18 @@ public class ModelFactory {
 
     //fullyOpaqueOverride: -1 = derive from these textures, 0/1 = force (plane models of a split solid block)
     public ModelBakeResultUpload buildInstanceModelUpload(int modelId, BlockState blockState, ColourDepthTextureData[] textureData, boolean isShaded, boolean darkenedTinting, RenderType layer, int doubleSidedOverride, int fullyOpaqueOverride) {
+        return this.buildInstanceModelUpload(modelId, blockState, textureData, isShaded, darkenedTinting, layer, doubleSidedOverride, fullyOpaqueOverride, false);
+    }
+
+    //nearestDepth: faces at the nearest depth of their pixels, for the planes of a split sloped model (see buildModelUpload)
+    public ModelBakeResultUpload buildInstanceModelUpload(int modelId, BlockState blockState, ColourDepthTextureData[] textureData, boolean isShaded, boolean darkenedTinting, RenderType layer, int doubleSidedOverride, int fullyOpaqueOverride, boolean nearestDepth) {
         int checkMode = layer==RenderType.solid()?TextureUtils.WRITE_CHECK_STENCIL:TextureUtils.WRITE_CHECK_ALPHA;
 
         ModelBakeResultUpload uploadResult = new ModelBakeResultUpload();
         uploadResult.modelId = modelId;
         long uploadPtr = uploadResult.model.address;
 
-        var depths = computeModelDepth(textureData, checkMode, layer!=RenderType.solid()?TextureUtils.DEPTH_MODE_MIN:TextureUtils.DEPTH_MODE_AVG);
+        var depths = computeModelDepth(textureData, checkMode, (nearestDepth || layer!=RenderType.solid())?TextureUtils.DEPTH_MODE_MIN:TextureUtils.DEPTH_MODE_AVG);
 
         boolean needsDoubleSidedQuads = (depths[0] < -0.1 && depths[1] < -0.1) || (depths[2] < -0.1 && depths[3] < -0.1) || (depths[4] < -0.1 && depths[5] < -0.1);
         if (doubleSidedOverride >= 0) needsDoubleSidedQuads = doubleSidedOverride == 1;
@@ -466,7 +484,17 @@ public class ModelFactory {
         }
 
 
-        var bakeResult = this.processTextureBakeResult(bake.blockId, bake.state, textureData, isShaded, hasDarkenedTextures, layer);
+        //Sloped models (e.g. Macaw's Roofs: tilted roof plates) have a continuous depth gradient on their faces, which a
+        // single quad per face flattens into one plane at the average depth - the LoD roof turned into floating ribs
+        // with gaps between them. Such models are split into depth planes like stepped camouflage blocks: every face
+        // becomes a fine staircase with shingled bands (see ModelPlaneSplitter), meshed by the secondary plane passes.
+        ColourDepthTextureData[][] planes = null;
+        if ((flags & 64) != 0 && layer != RenderType.translucent() && !(bake.state.getBlock() instanceof LiquidBlock)
+                && !instanceIsFullyOpaque(textureData, layer)) {
+            planes = ModelPlaneSplitter.split(textureData, ModelPlaneSplitter.MAX_PLANES, true, SLOPED_PLANE_LIP);
+        }
+
+        var bakeResult = this.processTextureBakeResult(bake.blockId, bake.state, textureData, isShaded, hasDarkenedTextures, layer, planes);
         if (bakeResult!=null) {
             this.uploadResults.add(bakeResult);
         }
@@ -561,78 +589,25 @@ public class ModelFactory {
         }
     }
 
-    private ModelBakeResultUpload processTextureBakeResult(int blockId, BlockState blockState, ColourDepthTextureData[] textureData, boolean isShaded, boolean darkenedTinting, RenderType layer) {
-        if (this.idMappings[blockId] != -1) {
-            //This should be impossible to reach as it means that multiple bakes for the same blockId happened and where inflight at the same time!
-            throw new IllegalStateException("Block id already added: " + blockId + " for state: " + blockState);
+    private int newModelId(ModelEntry entry) {
+        int modelId = this.modelTexture2id.size();
+        if (modelId >= this.instanceIdFloor && !this.loggedIdCollision) {
+            this.loggedIdCollision = true;
+            Logger.error("Voxy: normal block models (" + modelId + ") reached the camouflage instance model range (" + this.instanceIdFloor + "), some distant blocks may show wrong textures until restart");
         }
+        this.modelTexture2id.put(entry, modelId);
+        return modelId;
+    }
 
-        this.blockStatesInFlightLock.lock();
-        if (!this.blockStatesInFlight.contains(blockId)) {
-            this.blockStatesInFlightLock.unlock();
-            throw new IllegalStateException("processing a texture bake result but the block state was not in flight!!");
-        }
-        this.blockStatesInFlightLock.unlock();
-
-        //TODO: add thing for `blockState.hasEmissiveLighting()` and `blockState.getLuminance()`
-
-        boolean isFluid = blockState.getBlock() instanceof LiquidBlock;
-        int modelId = -1;
-
-
-        int clientFluidStateId = -1;
-
-        if ((!isFluid) && (!blockState.getFluidState().isEmpty())) {
-            //Insert into the fluid LUT
-            var fluidState = blockState.getFluidState().createLegacyBlock();
-
-            int fluidStateId = this.mapper.getIdForBlockState(fluidState);
-
-            clientFluidStateId = this.idMappings[fluidStateId];
-            if (clientFluidStateId == -1) {
-                throw new IllegalStateException("Block has a fluid state but fluid state is not already baked!!!");
-            }
-        }
-
-        var colourProvider = getColourProvider(blockState.getBlock());
-
-        boolean isBiomeColourDependent = false;
-        if (colourProvider != null) {
-            isBiomeColourDependent = isBiomeDependentColour(colourProvider, blockState);
-        }
-
-        ModelEntry entry;
-        {//Deduplicate same entries
-            entry = new ModelEntry(textureData, clientFluidStateId, isBiomeColourDependent||colourProvider==null?-1:captureColourConstant(colourProvider, blockState, DEFAULT_BIOME)|0xFF000000);
-            int possibleDuplicate = this.modelTexture2id.getInt(entry);
-            if (possibleDuplicate != -1) {//Duplicate found
-                this.idMappings[blockId] = possibleDuplicate;
-                modelId = possibleDuplicate;
-                //Remove from flight
-                this.blockStatesInFlightLock.lock();
-                if (!this.blockStatesInFlight.remove(blockId)) {
-                    this.blockStatesInFlightLock.unlock();
-                    throw new IllegalStateException();
-                }
-                this.blockStatesInFlightLock.unlock();
-                return null;
-            } else {//Not a duplicate so create a new entry
-                modelId = this.modelTexture2id.size();
-                if (modelId >= this.instanceIdFloor && !this.loggedIdCollision) {
-                    this.loggedIdCollision = true;
-                    Logger.error("Voxy: normal block models (" + modelId + ") reached the camouflage instance model range (" + this.instanceIdFloor + "), some distant blocks may show wrong textures until restart");
-                }
-                //NOTE: we set the mapping at the very end so that race conditions with this and getMetadata dont occur
-                //this.idMappings[blockId] = modelId;
-                this.modelTexture2id.put(entry, modelId);
-            }
-        }
-
-        if (isFluid) {
-            this.fluidStateLUT[modelId] = modelId;
-        } else if (clientFluidStateId != -1) {
-            this.fluidStateLUT[modelId] = clientFluidStateId;
-        }
+    //Builds the model data (metadata, per face data, colour, textures) of one model id.
+    // withFluid: the block contains a fluid (waterlogged) that is rendered with this model
+    // doubleSidedOverride: -1 = derive from these textures, 0/1 = force (planes of a split model)
+    // nearestDepth: place every face at the nearest depth of its pixels instead of the layer's default (the average for
+    //  solid models). Planes of a split sloped model must be: at the average depth the top step of a roof block sits
+    //  below the block edge (0.92 instead of 1.0), and where the block under the next roof row culls the faces between
+    //  them, that step leaves a see-through slit into the building. At the nearest depth every step lies on or in
+    //  front of the real surface, so the staircase is closed.
+    private ModelBakeResultUpload buildModelUpload(int modelId, BlockState blockState, ColourDepthTextureData[] textureData, boolean isShaded, boolean darkenedTinting, RenderType layer, boolean isFluid, boolean withFluid, BlockColor colourProvider, boolean isBiomeColourDependent, int tintingColour, int doubleSidedOverride, boolean nearestDepth) {
 
 
         int checkMode = layer==RenderType.solid()?TextureUtils.WRITE_CHECK_STENCIL:TextureUtils.WRITE_CHECK_ALPHA;
@@ -648,10 +623,10 @@ public class ModelFactory {
         // TODO: if it has a constant colour instead... idk why (apparently for things like spruce leaves)?? but premultiply the texture data by the constant colour
 
         //If it contains fluid but isnt a fluid
-        if ((!isFluid) && (!blockState.getFluidState().isEmpty()) && clientFluidStateId != -1) {
+        if (withFluid) {
 
             //Or it with the fluid state biome dependency
-            isBiomeColourDependent |= ModelQueries.isBiomeColoured(this.getModelMetadataFromClientId(clientFluidStateId));
+            isBiomeColourDependent |= ModelQueries.isBiomeColoured(this.getModelMetadataFromClientId(this.fluidStateLUT[modelId]));
         }
 
 
@@ -659,12 +634,13 @@ public class ModelFactory {
         //TODO: special case stuff like vines and glow lichen, where it can be represented by a single double sided quad
         // since that would help alot with perf of lots of vines, can be done by having one of the faces just not exist and the other be in no occlusion mode
 
-        var depths = computeModelDepth(textureData, checkMode, layer!=RenderType.solid()?TextureUtils.DEPTH_MODE_MIN:TextureUtils.DEPTH_MODE_AVG);
+        var depths = computeModelDepth(textureData, checkMode, (nearestDepth || layer!=RenderType.solid())?TextureUtils.DEPTH_MODE_MIN:TextureUtils.DEPTH_MODE_AVG);
 
         //TODO: THIS, note this can be tested for in 2 ways, re render the model with quad culling disabled and see if the result
         // is the same, (if yes then needs double sided quads)
         // another way to test it is if e.g. up and down havent got anything rendered but the sides do (e.g. all plants etc)
         boolean needsDoubleSidedQuads = (depths[0] < -0.1 && depths[1] < -0.1) || (depths[2] < -0.1 && depths[3] < -0.1) || (depths[4] < -0.1 && depths[5] < -0.1);
+        if (doubleSidedOverride >= 0) needsDoubleSidedQuads = doubleSidedOverride == 1;
 
 
         boolean cullsSame = false;
@@ -699,7 +675,7 @@ public class ModelFactory {
         metadata |= isBiomeColourDependent?1:0;
         metadata |= layer == RenderType.translucent()?2:0;
         metadata |= needsDoubleSidedQuads?4:0;
-        metadata |= ((!isFluid) && !blockState.getFluidState().isEmpty())?8:0;//Has a fluid state accosiacted with it and is not itself a fluid
+        metadata |= withFluid?8:0;//Has a fluid state accosiacted with it and is not itself a fluid
         metadata |= isFluid?16:0;//Is a fluid
 
         metadata |= cullsSame?32:0;
@@ -821,11 +797,12 @@ public class ModelFactory {
         MemoryUtil.memPutInt(uploadPtr, modelFlags); uploadPtr += 4;
 
 
+
         //Temporary override to always be non biome specific
         if (colourProvider == null) {
             MemoryUtil.memPutInt(uploadPtr, -1);//Set the default to nothing so that its faster on the gpu
         } else if (!isBiomeColourDependent) {
-            MemoryUtil.memPutInt(uploadPtr, entry.tintingColour);
+            MemoryUtil.memPutInt(uploadPtr, tintingColour);
         } else {
             //Populate the list of biomes for the model state
             int biomeIndex = this.modelsRequiringBiomeColours.size() * this.biomes.size();
@@ -860,6 +837,101 @@ public class ModelFactory {
         MipGen.putTextures(darkenedTinting, textureData, uploadResult.texture);
 
         //glGenerateTextureMipmap(this.textures.id);
+
+        return uploadResult;
+    }
+
+    private ModelBakeResultUpload processTextureBakeResult(int blockId, BlockState blockState, ColourDepthTextureData[] textureData, boolean isShaded, boolean darkenedTinting, RenderType layer, ColourDepthTextureData[][] planes) {
+        if (this.idMappings[blockId] != -1) {
+            //This should be impossible to reach as it means that multiple bakes for the same blockId happened and where inflight at the same time!
+            throw new IllegalStateException("Block id already added: " + blockId + " for state: " + blockState);
+        }
+
+        this.blockStatesInFlightLock.lock();
+        if (!this.blockStatesInFlight.contains(blockId)) {
+            this.blockStatesInFlightLock.unlock();
+            throw new IllegalStateException("processing a texture bake result but the block state was not in flight!!");
+        }
+        this.blockStatesInFlightLock.unlock();
+
+        //TODO: add thing for `blockState.hasEmissiveLighting()` and `blockState.getLuminance()`
+
+        boolean isFluid = blockState.getBlock() instanceof LiquidBlock;
+        int modelId = -1;
+
+
+        int clientFluidStateId = -1;
+
+        if ((!isFluid) && (!blockState.getFluidState().isEmpty())) {
+            //Insert into the fluid LUT
+            var fluidState = blockState.getFluidState().createLegacyBlock();
+
+            int fluidStateId = this.mapper.getIdForBlockState(fluidState);
+
+            clientFluidStateId = this.idMappings[fluidStateId];
+            if (clientFluidStateId == -1) {
+                throw new IllegalStateException("Block has a fluid state but fluid state is not already baked!!!");
+            }
+        }
+
+        var colourProvider = getColourProvider(blockState.getBlock());
+
+        boolean isBiomeColourDependent = false;
+        if (colourProvider != null) {
+            isBiomeColourDependent = isBiomeDependentColour(colourProvider, blockState);
+        }
+
+        ModelEntry entry;
+        {//Deduplicate same entries
+            //A split model is keyed by its unsplit textures: identical textures always split into identical planes, so a
+            // duplicate also shares the extra planes registered for it
+            entry = new ModelEntry(textureData, clientFluidStateId, isBiomeColourDependent||colourProvider==null?-1:captureColourConstant(colourProvider, blockState, DEFAULT_BIOME)|0xFF000000, planes != null ? VARIANT_SPLIT : VARIANT_NORMAL);
+            int possibleDuplicate = this.modelTexture2id.getInt(entry);
+            if (possibleDuplicate != -1) {//Duplicate found
+                this.idMappings[blockId] = possibleDuplicate;
+                modelId = possibleDuplicate;
+                //Remove from flight
+                this.blockStatesInFlightLock.lock();
+                if (!this.blockStatesInFlight.remove(blockId)) {
+                    this.blockStatesInFlightLock.unlock();
+                    throw new IllegalStateException();
+                }
+                this.blockStatesInFlightLock.unlock();
+                return null;
+            } else {//Not a duplicate so create a new entry
+                //NOTE: we set the mapping at the very end so that race conditions with this and getMetadata dont occur
+                //this.idMappings[blockId] = modelId;
+                modelId = this.newModelId(entry);
+            }
+        }
+
+        if (isFluid) {
+            this.fluidStateLUT[modelId] = modelId;
+        } else if (clientFluidStateId != -1) {
+            this.fluidStateLUT[modelId] = clientFluidStateId;
+        }
+
+        boolean withFluid = (!isFluid) && (!blockState.getFluidState().isEmpty()) && clientFluidStateId != -1;
+        ModelBakeResultUpload uploadResult;
+        if (planes == null) {
+            uploadResult = this.buildModelUpload(modelId, blockState, textureData, isShaded, darkenedTinting, layer, isFluid, withFluid, colourProvider, isBiomeColourDependent, entry.tintingColour, -1, false);
+        } else {
+            //Double sidedness is a property of the whole block, not of one plane (see instanceNeedsDoubleSided)
+            int doubleSided = instanceNeedsDoubleSided(textureData, layer) ? 1 : 0;
+            uploadResult = this.buildModelUpload(modelId, blockState, planes[0], isShaded, darkenedTinting, layer, isFluid, withFluid, colourProvider, isBiomeColourDependent, entry.tintingColour, doubleSided, true);
+            int[] extra = new int[planes.length - 1];
+            for (int plane = 1; plane < planes.length; plane++) {
+                //The fluid (waterlogging) belongs to the primary only
+                var planeEntry = new ModelEntry(planes[plane], -1, entry.tintingColour, VARIANT_PLANE + doubleSided);
+                int planeId = this.modelTexture2id.getInt(planeEntry);
+                if (planeId == -1) {
+                    planeId = this.newModelId(planeEntry);
+                    this.uploadResults.add(this.buildModelUpload(planeId, blockState, planes[plane], isShaded, darkenedTinting, layer, false, false, colourProvider, isBiomeColourDependent, entry.tintingColour, doubleSided, true));
+                }
+                extra[plane - 1] = planeId;
+            }
+            this.secondaryModelIds[modelId] = extra;
+        }
 
         //Set the mapping at the very end
         this.idMappings[blockId] = modelId;
@@ -1146,6 +1218,11 @@ public class ModelFactory {
 
     public int[] _unsafeRawAccess() {
         return this.idMappings;
+    }
+
+    //Extra depth-plane model ids of a split model (null if the model is a single plane)
+    public int[] getSecondaryModelIds(int modelId) {
+        return this.secondaryModelIds[modelId];
     }
 
     public int getModelId(int blockId) {

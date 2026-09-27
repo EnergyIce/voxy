@@ -27,6 +27,7 @@ public class CamouflageBlockCompat {
     private static Class<?> copycatsPlusBlockClass;
     private static Class<?> trafficCraftPaintableClass;
     private static Class<?> trafficCraftTownSignClass;
+    private static Class<?> pawCantileverBlockClass;
 
     private static synchronized void init() {
         if (initialized) return;
@@ -75,6 +76,15 @@ public class CamouflageBlockCompat {
         } catch (ReflectiveOperationException e) {
             trafficCraftPaintableClass = null;
         }
+
+        //Create: Pantographs and Wires cantilevers: their whole shape (width, height, offsets, insulators, registration
+        // arms, sub cantilevers) is stored in the block entity and handed to the model as DragonLib model context.
+        try {
+            pawCantileverBlockClass = Class.forName("de.mrjulsen.paw.block.abstractions.AbstractCantileverBlock");
+            Logger.info("Voxy: Create: Pantographs and Wires cantilever instance-render compat enabled");
+        } catch (ReflectiveOperationException e) {
+            pawCantileverBlockClass = null;
+        }
     }
 
     //Cheap pre-check usable on a bare BlockState (e.g. while scanning a section's palette),
@@ -90,6 +100,9 @@ public class CamouflageBlockCompat {
         if (trafficCraftPaintableClass != null && trafficCraftPaintableClass.isInstance(block)
                 && block instanceof net.minecraft.world.level.block.EntityBlock
                 && (trafficCraftTownSignClass == null || !trafficCraftTownSignClass.isInstance(block))) {
+            return true;
+        }
+        if (pawCantileverBlockClass != null && pawCantileverBlockClass.isInstance(block)) {
             return true;
         }
         if (framedBlockEntityClass != null) {

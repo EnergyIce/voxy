@@ -377,7 +377,11 @@ public class InstanceModelBaker {
                 return;
             }
         }
-        var planes = !solidCube ? ModelPlaneSplitter.split(textureData) : null;
+        //Sloped camouflage (Framed Blocks / Copycats+ slopes, corners, prisms) gets the same treatment as sloped normal
+        // models: a lip over the neighbouring deeper band and every plane at its nearest depth, which closes the gaps
+        // between the steps of the staircase. Stepped models (stairs, bytes, layers) keep their exact planes.
+        final boolean sloped = (flags & 64) != 0;
+        var planes = !solidCube ? (sloped ? ModelPlaneSplitter.split(textureData, ModelPlaneSplitter.MAX_PLANES, true, ModelFactory.SLOPED_PLANE_LIP) : ModelPlaneSplitter.split(textureData)) : null;
         int planesBase = planes != null ? this.allocateIds(planes.length) : -1;
         if (planesBase != -1) {
             //Stepped/layered model: one Voxy model per depth plane (nearest first), primary + secondaries
@@ -388,7 +392,7 @@ public class InstanceModelBaker {
             for (int plane = 0; plane < planes.length; plane++) {
                 ids[plane] = planesBase + plane;
                 var layer = chooseLayer(planes[plane], anyTranslucentQuads, anyDiscardQuads, isLeaves);
-                this.modelFactory.enqueueUpload(this.modelFactory.buildInstanceModelUpload(ids[plane], key.wrapperState(), planes[plane], isShaded, hasDarkenedTextures, layer, doubleSided, fullyOpaque));
+                this.modelFactory.enqueueUpload(this.modelFactory.buildInstanceModelUpload(ids[plane], key.wrapperState(), planes[plane], isShaded, hasDarkenedTextures, layer, doubleSided, fullyOpaque, sloped));
             }
             //Registered before the primary is marked resolved so the mesher never sees a primary without them
             this.setSecondary(instanceIndex, java.util.Arrays.copyOfRange(ids, 1, ids.length));

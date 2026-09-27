@@ -126,6 +126,33 @@ public class SoftwareModelTextureBakery {
         this.rasterizer.setSamplerTexture(this.atlasPixels, this.atlasWidth, this.atlasHeight);
     }
 
+    //Area (in blocks^2) of the quads of the last renderToOutput() that are inclined (neither horizontal nor vertical,
+    // e.g. Macaw's Roofs' tilted roof plates). Such surfaces have a continuous depth gradient along a face.
+    private float inclinedArea;
+    //A quarter block face of sloped surface: roofs, slopes. Small tilted details (wall torches, levers) stay below.
+    private static final float SLOPED_MIN_AREA = 0.25f;
+
+    //Area of a quad if it is inclined, else 0. Plants and other diagonal but vertical quads don't count: seen from
+    // above they are edge-on, seen from the side they are flat.
+    private static float inclinedQuadArea(BakedQuad quad) {
+        int[] v = quad.getVertices();
+        int stride = v.length / 4;
+        if (stride < 3) return 0;
+        float x0 = Float.intBitsToFloat(v[0]), y0 = Float.intBitsToFloat(v[1]), z0 = Float.intBitsToFloat(v[2]);
+        float x1 = Float.intBitsToFloat(v[stride]), y1 = Float.intBitsToFloat(v[stride + 1]), z1 = Float.intBitsToFloat(v[stride + 2]);
+        float x2 = Float.intBitsToFloat(v[stride * 2]), y2 = Float.intBitsToFloat(v[stride * 2 + 1]), z2 = Float.intBitsToFloat(v[stride * 2 + 2]);
+        float x3 = Float.intBitsToFloat(v[stride * 3]), y3 = Float.intBitsToFloat(v[stride * 3 + 1]), z3 = Float.intBitsToFloat(v[stride * 3 + 2]);
+        //Cross product of the diagonals: direction = normal, length = 2 * area
+        float ax = x2 - x0, ay = y2 - y0, az = z2 - z0;
+        float bx = x3 - x1, by = y3 - y1, bz = z3 - z1;
+        float nx = ay * bz - az * by, ny = az * bx - ax * bz, nz = ax * by - ay * bx;
+        float len = (float) Math.sqrt(nx * nx + ny * ny + nz * nz);
+        if (len < 1e-6f) return 0;
+        float vertical = Math.abs(ny) / len;
+        if (vertical < 0.1f || vertical > 0.99f) return 0;
+        return len * 0.5f;
+    }
+
     private void bakeBlockModel(BlockState state, RenderType layer) {
         if (state.getRenderShape() == RenderShape.INVISIBLE) {
             return;// Dont bake if invisible
@@ -135,6 +162,7 @@ public class SoftwareModelTextureBakery {
                 .getBlockModelShaper()
                 .getBlockModel(state);
 
+        boolean anyQuads = false;
         for (Direction direction : new Direction[] { Direction.DOWN, Direction.UP, Direction.NORTH, Direction.SOUTH,
                 Direction.WEST, Direction.EAST, null }) {
             List<BakedQuad> quads;
@@ -151,10 +179,17 @@ public class SoftwareModelTextureBakery {
                 continue;
             }
             for (var quad : quads) {
+                anyQuads = true;
+                this.inclinedArea += inclinedQuadArea(quad);
                 (layer == RenderType.translucent() ? this.translucentVC : this.opaqueVC)
                         .quad(quad, state.is(BlockTags.LEAVES), layer);
             }
         }
+        //? if forge || neoforge {
+        if (!anyQuads) {
+            this.bakeBlockModelByRenderType(state, model);
+        }
+        //?}
     }
 
     //? if forge || neoforge {
@@ -196,6 +231,40 @@ public class SoftwareModelTextureBakery {
         return group;
     }
 
+    //Some models only answer the render-type aware query the chunk renderer uses, and return nothing for the plain
+    // getQuads(state, side, rand): e.g. every DragonLib DynamicBakedModel (Create: Pantographs and Wires masts,
+    // brackets, insulators, cantilevers ...) keeps its quads per render type and returns an empty list for a null
+    // render type, which left all of those blocks invisible in the LoD. Query them like the chunk renderer does:
+    // every render type the model reports, with empty model data.
+    private void bakeBlockModelByRenderType(BlockState state, net.minecraft.client.resources.model.BakedModel model) {
+        List<RenderType> layers = new ArrayList<>();
+        try {
+            for (var rt : model.getRenderTypes(state, new SingleThreadedRandomSource(42L), ModelData.EMPTY)) {
+                layers.add(rt);
+            }
+        } catch (Exception e) {
+            Logger.error("Voxy: a block model threw while listing render types for " + state, e);
+            return;
+        }
+        for (var layer : layers) {
+            for (Direction direction : new Direction[] { Direction.DOWN, Direction.UP, Direction.NORTH, Direction.SOUTH,
+                    Direction.WEST, Direction.EAST, null }) {
+                List<BakedQuad> quads;
+                try {
+                    quads = model.getQuads(state, direction, new SingleThreadedRandomSource(42L), ModelData.EMPTY, layer);
+                } catch (Exception e) {
+                    Logger.error("Voxy: a block model threw while baking " + state + " (face " + direction + ", " + layer + "), skipping that face", e);
+                    continue;
+                }
+                for (var quad : quads) {
+                    this.inclinedArea += inclinedQuadArea(quad);
+                    (layer == RenderType.translucent() ? this.translucentVC : this.opaqueVC)
+                            .quad(quad, state.is(BlockTags.LEAVES), layer);
+                }
+            }
+        }
+    }
+
     private void bakeBlockModelWithData(BlockState state, RenderType layer, ModelData modelData) {
         if (state.getRenderShape() == RenderShape.INVISIBLE) {
             return;// Dont bake if invisible
@@ -216,6 +285,7 @@ public class SoftwareModelTextureBakery {
                 continue;
             }
             for (var quad : quads) {
+                this.inclinedArea += inclinedQuadArea(quad);
                 int tintGroup = quad.isTinted() ? this.tintGroupFor(state, quad.getTintIndex()) : 0;
                 (layer == RenderType.translucent() ? this.translucentVC : this.opaqueVC)
                         .quad(quad, state.is(BlockTags.LEAVES), layer, tintGroup << 8);
@@ -314,6 +384,7 @@ public class SoftwareModelTextureBakery {
 
         this.opaqueVC.reset();
         this.translucentVC.reset();
+        this.inclinedArea = 0;
         this.tintLevel = blockEntity != null ? new IsolatedBlockGetter(state, blockEntity) : null;
         this.tintCount = 0;
         this.tintGroupByIndex.clear();
@@ -409,7 +480,8 @@ public class SoftwareModelTextureBakery {
 
         boolean anyOpaque = !this.opaqueVC.isEmpty();
         this.tintLevel = null;//Don't keep the detached block entity alive between bakes
-        return (isAnyShaded ? 1 : 0) | (isAnyDarkend ? 2 : 0) | (anyTranslucent ? 4 : 0) | (anyDiscard ? 8 : 0) | (hadAnyQuads ? 16 : 0) | (anyOpaque ? 32 : 0);
+        //64: substantial inclined (sloped) surface, see renderToOutput
+        return (isAnyShaded ? 1 : 0) | (isAnyDarkend ? 2 : 0) | (anyTranslucent ? 4 : 0) | (anyDiscard ? 8 : 0) | (hadAnyQuads ? 16 : 0) | (anyOpaque ? 32 : 0) | (this.inclinedArea >= SLOPED_MIN_AREA ? 64 : 0);
     }
     //?}
 
@@ -515,8 +587,12 @@ public class SoftwareModelTextureBakery {
     // in this version the values are simply appended
     // (0,0),(1,0),(2,0),(0,1),(1,1),(2,1)
 
+    //Returned flags: 1 shaded, 2 darkened textures, 4 translucent quads, 8 discard quads, 64 has a substantial amount of
+    // inclined (sloped) surface
     public int renderToOutput(BlockState state, long outputBuffer) {
         MemoryUtil.memSet(outputBuffer, 0, 16 * 16 * 8 * 6);
+        this.inclinedArea = 0;
+        this.rasterizer.setClampNear(false);
 
         boolean isBlock = true;
         if (state.getBlock() instanceof LiquidBlock) {
@@ -548,6 +624,8 @@ public class SoftwareModelTextureBakery {
             this.opaqueVC.reset();
             this.translucentVC.reset();
             this.bakeBlockModel(state, blockRenderLayer);
+            //Sloped models overhang their block (see SoftwareRasterizer#setClampNear)
+            this.rasterizer.setClampNear(this.inclinedArea >= SLOPED_MIN_AREA);
             isAnyShaded |= this.opaqueVC.anyShaded | this.translucentVC.anyShaded;
             isAnyDarkend |= this.opaqueVC.anyDarkendTex | this.translucentVC.anyDarkendTex;
             anyTranslucent |= !this.translucentVC.isEmpty();
@@ -592,7 +670,9 @@ public class SoftwareModelTextureBakery {
             }
         }
 
-        return (isAnyShaded ? 1 : 0) | (isAnyDarkend ? 2 : 0) | (anyTranslucent ? 4 : 0) | (anyDiscard ? 8 : 0);
+        this.rasterizer.setClampNear(false);
+        boolean sloped = this.inclinedArea >= SLOPED_MIN_AREA;
+        return (isAnyShaded ? 1 : 0) | (isAnyDarkend ? 2 : 0) | (anyTranslucent ? 4 : 0) | (anyDiscard ? 8 : 0) | (sloped ? 64 : 0);
     }
 
     static {

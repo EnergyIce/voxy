@@ -262,6 +262,7 @@ public class RenderDataFactory {
                     sectionData[i * 2 + 1] = 0;
                 } else {
                     int modelId = rawModelIds[Mapper.getBlockId(block)];
+                    boolean usesInstanceModel = false;
                     if (Mapper.hasInstanceOverride(block)) {
                         //Camouflage/mimicry voxel (see CamouflageBlockCompat) - use its real, per-instance
                         // baked model. This is resolved BEFORE requiring the wrapper's plain per-BlockState
@@ -272,6 +273,7 @@ public class RenderDataFactory {
                         int instanceModelId = this.instanceBaker.getModelId(instanceIndex);
                         if (instanceModelId != -1) {
                             modelId = instanceModelId;
+                            usesInstanceModel = true;
                             int[] sec = this.instanceBaker.getSecondaryModelIds(instanceIndex);
                             if (sec != null && sec.length != 0) {
                                 this.secVoxel[this.secCount] = i;
@@ -298,6 +300,17 @@ public class RenderDataFactory {
                         sectionData[i * 2] = (block & (0xFFL << 56)) >>> 1;
                         sectionData[i * 2 + 1] = 0;
                     } else {
+                        if (!usesInstanceModel) {
+                            //Normal model split into depth planes (sloped models, see ModelFactory#processModelResult)
+                            int[] sec = this.modelMan.getSecondaryModelIds(modelId);
+                            if (sec != null && sec.length != 0) {
+                                this.secVoxel[this.secCount] = i;
+                                for (int e = 0; e < MAX_EXTRA_PLANES; e++) {
+                                    this.secModel[e][this.secCount] = e < sec.length ? sec[e] : -1;
+                                }
+                                this.secCount++;
+                            }
+                        }
                         //TODO: cache the results of this, then link it to `block` do same optimization as SaveLoadSystem3
 
                         long modelMetadata = this.modelMan.getModelMetadataFromClientId(modelId);

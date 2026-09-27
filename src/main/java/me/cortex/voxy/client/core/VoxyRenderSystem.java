@@ -283,11 +283,7 @@ public class VoxyRenderSystem {
         this.pipeline.preSetup(viewport);
 
         TimingStatistics.E.start();
-        if ((!VoxyClient.disableSodiumChunkRender())&&!IrisUtil.irisShadowActive()) {
-            this.chunkBoundRenderer.render(viewport);
-        } else {
-            viewport.depthBoundingBuffer.clear(this.properties.inverseClearDepth());
-        }
+        this.chunkBoundRenderer.render(viewport, (!VoxyClient.disableSodiumChunkRender())&&!IrisUtil.irisShadowActive());
         TimingStatistics.E.stop();
 
 

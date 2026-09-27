@@ -29,6 +29,8 @@ layout(location = 0) out flat uvec4 interData;
 #ifndef USE_NV_BARRY
 layout(location = 1) out vec2 uv;
 #endif
+//Position relative to (baseSectionPos<<5), used to test whether vanilla draws the section this fragment lies in
+layout(location = 2) out vec3 voxyMaskPos;
 
 #ifdef USE_NV_JANK
 #ifdef GL_NV_gpu_shader5
@@ -68,6 +70,8 @@ void main() {
     #ifndef USE_NV_BARRY
     uv = getCornerUV(quad, cornerId);
     #endif
+
+    voxyMaskPos = getQuadCornerPoint(quad, cornerId);
 
     //Note: other data is automatically discarded as it is undefiend and has not been generated
     interData = quad.attributeData;
