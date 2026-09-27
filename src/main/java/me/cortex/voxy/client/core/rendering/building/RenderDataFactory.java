@@ -220,7 +220,8 @@ public class RenderDataFactory {
     // model isn't baked yet - see InstanceModelBaker for why that's a safe, self-healing fallback.
     private int resolveModelId(long raw) {
         if (Mapper.hasInstanceOverride(raw)) {
-            int instanceModelId = this.instanceBaker.getModelId(Mapper.getInstanceIndex(raw));
+            int instanceIndex = this.world.getInstanceKeyRegistry().canonicalIndex(Mapper.getInstanceIndex(raw));
+            int instanceModelId = instanceIndex < 0 ? -1 : this.instanceBaker.getModelId(instanceIndex);
             if (instanceModelId != -1) {
                 return instanceModelId;
             }
@@ -246,6 +247,7 @@ public class RenderDataFactory {
 
     private int prepareSectionData(final long[] rawSectionData) {
         final var sectionData = this.sectionData;
+        final var instanceRegistry = this.world.getInstanceKeyRegistry();
         final var rawModelIds = this.modelMan._unsafeRawAccess();
         long opaque = 0;
         long notEmpty = 0;
@@ -263,13 +265,14 @@ public class RenderDataFactory {
                 } else {
                     int modelId = rawModelIds[Mapper.getBlockId(block)];
                     boolean usesInstanceModel = false;
-                    if (Mapper.hasInstanceOverride(block)) {
+                    //Duplicate stored instances share one baked model; -1 = no instance needed (see canonicalIndex)
+                    int instanceIndex = Mapper.hasInstanceOverride(block) ? instanceRegistry.canonicalIndex(Mapper.getInstanceIndex(block)) : -1;
+                    if (instanceIndex >= 0) {
                         //Camouflage/mimicry voxel (see CamouflageBlockCompat) - use its real, per-instance
                         // baked model. This is resolved BEFORE requiring the wrapper's plain per-BlockState
                         // model: the instance model fully replaces it, and demanding the plain bake first
                         // needlessly held up (or, if that plain bake never completed, permanently blocked)
                         // meshing of every section containing such a block.
-                        int instanceIndex = Mapper.getInstanceIndex(block);
                         int instanceModelId = this.instanceBaker.getModelId(instanceIndex);
                         if (instanceModelId != -1) {
                             modelId = instanceModelId;
@@ -1860,10 +1863,11 @@ public class RenderDataFactory {
         //Prepare everything
         int neighborMskAndFlags = this.prepareSectionData(section._unsafeGetRawDataArray());
         if ((neighborMskAndFlags&(1<<31))!=0) {//We failed to get everything so throw exception
-            //INSTANCE_PENDING_FLAG means this isn't a blockId at all (it's an instance index) - don't
-            // treat it as isIdBlockId, so the retry path doesn't call requestBlockBake on it.
+            //INSTANCE_PENDING_FLAG means this isn't a blockId at all (it's an instance index, up to 26 bits) - don't
+            // treat it as isIdBlockId, so the retry path doesn't call requestBlockBake on it, but parks the task until
+            // that instance is baked.
             boolean isInstancePending = (neighborMskAndFlags & INSTANCE_PENDING_FLAG) != 0;
-            throw new IdNotYetComputedException(neighborMskAndFlags&((1<<20)-1), !isInstancePending);
+            throw new IdNotYetComputedException(neighborMskAndFlags&(isInstancePending?(INSTANCE_PENDING_FLAG-1):((1<<20)-1)), !isInstancePending);
         }
         int neighborMsk = neighborMskAndFlags&0b11_11_11;
         int flags = neighborMskAndFlags>>>6;

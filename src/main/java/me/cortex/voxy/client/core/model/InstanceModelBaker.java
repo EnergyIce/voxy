@@ -147,10 +147,22 @@ public class InstanceModelBaker {
         }
     }
 
+    //Called (on the thread that baked it) once an instance reached its final result, so sections waiting for it can
+    // be meshed again (see RenderGenerationService#onInstanceResolved)
+    private volatile java.util.function.IntConsumer resolveListener;
+
+    public void setResolveListener(java.util.function.IntConsumer listener) {
+        this.resolveListener = listener;
+    }
+
     //All writes to resolved must go through here, so they share the same monitor as the reads above.
     private void setResolved(int instanceIndex, int modelId) {
         synchronized (this.lock) {
             this.resolved.put(instanceIndex, modelId);
+        }
+        var listener = this.resolveListener;
+        if (listener != null) {
+            listener.accept(instanceIndex);
         }
     }
 

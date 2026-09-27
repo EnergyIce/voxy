@@ -28,6 +28,7 @@ If you don't have Java 21 installed yet, get it for example from [Eclipse Temuri
 - **No more invisible chunks at the edge of the render distance:** the LoD is now hidden exactly where Embeddium/Sodium really draws chunks (per pixel, using its own render distance rules), instead of an approximation that left holes along the border and next to chunks that were still loading.
 - **Sloped blocks in the LoD:** blocks with tilted surfaces - e.g. all Macaw's Roofs roofs (normal, steep, lower, top, corners, attic roofs, awnings) - are rendered as a fine, closed staircase that follows the real slope, instead of stacked cubes with see-through gaps between the roof rows. Framed Blocks / Copycats+ slopes get the same treatment.
 - **Create: Pantographs and Wires in the LoD:** masts, brackets and insulators are now visible. Cantilevers, tensioning devices, wires and pantographs are not part of the LoD.
+- **Faster LoD loading in busy worlds:** camouflage/TrafficCraft instances that older versions stored many times over (e.g. for every state of a CRN display or traffic light) now share one baked model, and LoD sections waiting for such a bake no longer hold up the rest of the LoD. This fixes LoDs not appearing until Voxy was toggled off and on in worlds with LoD data from older versions.
 - **No error messages on screen:** Voxy errors are only written to the log, no more white text in the action bar.
 - **Distant Horizons import** supports DH's newer `DataFormatVersion 2` databases (`/voxy import distant_horizons`).
 

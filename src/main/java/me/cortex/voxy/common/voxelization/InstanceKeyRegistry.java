@@ -6,6 +6,8 @@ import net.minecraft.nbt.CompoundTag;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
 
+import it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap;
+
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -35,8 +37,18 @@ public class InstanceKeyRegistry {
     private final java.util.ArrayList<Key> index2key = new java.util.ArrayList<>();
     private final Mapper mapper;
 
+    //Stored index -> the index that actually represents its (canonicalized) key, for stored indices that are
+    // duplicates of another one, or -1 for stored instances whose data doesn't need an instance any more. Stored
+    // voxel data still references every index it was ingested with: older versions registered one index per
+    // variation of volatile block entity data (CRN displays, traffic lights, ... - tens of thousands in a busy
+    // world), which now collapse to a handful of keys. Without this every one of those indices was baked on its
+    // own each session, which could use up the whole model id space and keep the LoDs waiting for minutes.
+    // Only written in the constructor, read-only afterwards (safe to read from any thread).
+    private final Int2IntOpenHashMap aliases = new Int2IntOpenHashMap();
+
     public InstanceKeyRegistry(Mapper mapper) {
         this.mapper = mapper;
+        this.aliases.defaultReturnValue(Integer.MIN_VALUE);
         for (var entry : mapper.loadInstanceEntries()) {
             while (this.index2key.size() <= entry.index()) {
                 this.index2key.add(null);//Gap (entry lost/unreadable): index stays unresolved, never reused
@@ -44,8 +56,25 @@ public class InstanceKeyRegistry {
             //Canonicalized on load too, so entries stored by older versions with volatile data collapse again
             var key = new Key(entry.state(), canonicalizeNbt(entry.nbt()));
             this.index2key.set(entry.index(), key);
-            this.key2index.putIfAbsent(key, entry.index());
+            if (!needsInstance(entry.nbt())) {
+                this.aliases.put(entry.index(), -1);
+                continue;
+            }
+            Integer existing = this.key2index.putIfAbsent(key, entry.index());
+            if (existing != null && existing != entry.index()) {
+                this.aliases.put(entry.index(), (int) existing);
+            }
         }
+        if (!this.aliases.isEmpty()) {
+            Logger.info("Voxy: " + this.aliases.size() + " stored camouflage instances are duplicates or no longer needed, sharing their models");
+        }
+    }
+
+    //The index whose baked model a stored instance index uses (itself unless it's a duplicate), or -1 if the voxel
+    // should just use its block's normal model
+    public int canonicalIndex(int index) {
+        int alias = this.aliases.get(index);
+        return alias == Integer.MIN_VALUE ? index : alias;
     }
 
     //Returns the stable index for this key, registering it if it's new. Thread-safe, callable
