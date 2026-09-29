@@ -7,7 +7,8 @@ import net.neoforged.moddevgradle.legacyforge.dsl.MixinExtension
 
 extra["loaderName"] = "legacyforge"
 extra["loaderDisplayName"] = "LegacyForge"
-extra["archiveTaskName"] = "jar"
+//reobfJar, not jar: legacy Forge runs on SRG names, the plain jar (build/devlibs) is the dev-only mojmap jar
+extra["archiveTaskName"] = "reobfJar"
 extra["sourceJavaDir"] = "src/forge/java"
 
 plugins {

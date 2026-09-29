@@ -248,7 +248,17 @@ public abstract class VoxyInstance {
                     }
                     //Dont lock in the loopy thing, this should basicly never happen if it does something horrific happened
                     this.activeWorldLock.unlockWrite(stamp);
+                    //Diagnostic: if this genuinely never resolves (nothing releases the world's ref or
+                    // drops its active sections), this used to hang totally silently forever - log
+                    // periodically so a stuck shutdown at least tells us WHICH of the two conditions in
+                    // isWorldUsed() is stuck, instead of just spinning with no visibility.
+                    long lastStallLog = System.currentTimeMillis();
                     while (world.isWorldUsed()) {
+                        long now = System.currentTimeMillis();
+                        if (now - lastStallLog >= 1000) {
+                            lastStallLog = now;
+                            Logger.error("Voxy: still waiting for a world to stop being used during shutdown - refCount=" + world.getRefCount() + " activeSectionCount=" + world.getActiveSectionCount());
+                        }
                         try {
                             //noinspection BusyWait
                             Thread.sleep(10);

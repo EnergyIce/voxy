@@ -6,7 +6,7 @@
     "commit": "${commit}",
     "buildtime": "${buildtime}"
   },
-  "name": "Voxy",
+  "name": "${mod_name}",
   "description": "Far distance rendering mod utilising LoDs",
   "authors": [
     "Cortex"

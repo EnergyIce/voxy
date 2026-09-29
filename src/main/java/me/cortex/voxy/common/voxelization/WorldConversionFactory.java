@@ -12,6 +12,8 @@ import net.minecraft.util.Mth;
 import net.minecraft.util.SimpleBitStorage;
 import net.minecraft.util.ZeroBitStorage;
 import net.minecraft.world.level.biome.Biome;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.GlobalPalette;
 import net.minecraft.world.level.chunk.HashMapPalette;
@@ -20,6 +22,8 @@ import net.minecraft.world.level.chunk.Palette;
 import net.minecraft.world.level.chunk.PalettedContainer;
 import net.minecraft.world.level.chunk.PalettedContainerRO;
 import net.minecraft.world.level.chunk.SingleValuePalette;
+import org.jetbrains.annotations.Nullable;
+import java.util.Map;
 import java.util.WeakHashMap;
 
 public class WorldConversionFactory {
@@ -219,6 +223,87 @@ public class WorldConversionFactory {
         return section;
     }
 
+
+    //Cheap pre-check (bounded by the section's palette size, NOT 4096) to decide whether a section
+    // needs the slow, BlockEntity-aware conversion path below. GlobalPalette sections conservatively
+    // report true since walking the entire global block state registry per section would be far too
+    // expensive - those are rare (very block-diverse sections) so this is an acceptable tradeoff.
+    public static boolean sectionMayContainCompatBlocks(PalettedContainer<BlockState> blockContainer) {
+        var vp = blockContainer.data.palette();
+        if (vp instanceof GlobalPalette<BlockState>) {
+            return true;
+        }
+        for (int i = 0; i < vp.getSize(); i++) {
+            BlockState state = null;
+            try { state = vp.valueFor(i); } catch (Exception e) {}
+            if (state != null && CamouflageBlockCompat.mightNeedResolve(state.getBlock())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    //Slower, non-bit-packed sibling of convert() that additionally tags camouflage/mimicry blocks
+    // (Framed Blocks, Create's Copycat, Copycats+) with a per-instance model override pointing at
+    // their real, individually baked appearance (see InstanceKeyRegistry / InstanceModelBaker),
+    // instead of always baking their bare/no-camo appearance. The block id keeps pointing at the
+    // wrapper's own BlockState (correct shape/geometry, as normal) - only the sampled texture is
+    // overridden at render time. Only meant to be used for the (rare) sections where
+    // sectionMayContainCompatBlocks() returned true - normal sections keep using the fast convert() path.
+    public static VoxelizedSection convertSlow(VoxelizedSection section,
+                                                Mapper stateMapper,
+                                                InstanceKeyRegistry instanceKeyRegistry,
+                                                PalettedContainer<BlockState> blockContainer,
+                                                PalettedContainerRO<Holder<Biome>> biomeContainer,
+                                                ILightingSupplier lightSupplier,
+                                                BlockPos sectionOrigin,
+                                                @Nullable Map<BlockPos, net.minecraft.nbt.CompoundTag> blockEntityNbt) {
+        var data = section.section;
+        int[] biomes = new int[4 * 4 * 4];
+
+        {
+            int i = 0;
+            for (int y = 0; y < 4; y++) {
+                for (int z = 0; z < 4; z++) {
+                    for (int x = 0; x < 4; x++) {
+                        biomes[i++] = stateMapper.getIdForBiome(biomeContainer.get(x, y, z));
+                    }
+                }
+            }
+        }
+
+        int nonZeroCnt = 0;
+        for (int i = 0; i <= 0xFFF; i++) {
+            int x = i & 0xF;
+            int z = (i >> 4) & 0xF;
+            int y = (i >> 8) & 0xF;
+
+            BlockState state = blockContainer.get(x, y, z);
+            if (state == null) state = Blocks.AIR.defaultBlockState();
+
+            int bId = stateMapper.getIdForBlockState(state);
+            byte light = lightSupplier.supply(x, y, z);
+            nonZeroCnt += (bId != 0) ? 1 : 0;
+            long voxel = Mapper.composeMappingId(light, bId, biomes[Integer.compress(i, 0b1100_1100_1100)]);
+
+            if (bId != 0 && CamouflageBlockCompat.mightNeedResolve(state.getBlock())) {
+                var nbt = blockEntityNbt == null ? null : blockEntityNbt.get(sectionOrigin.offset(x, y, z));
+                if (nbt != null) {
+                    try {
+                        int instanceIndex = instanceKeyRegistry.getOrCreateIndex(state, nbt);
+                        if (instanceIndex >= 0) {
+                            voxel = Mapper.withInstanceOverride(voxel, instanceIndex);
+                        }
+                    } catch (Exception e) {
+                        //Fall back to the plain per-BlockState appearance for this voxel
+                    }
+                }
+            }
+            data[i] = voxel;
+        }
+        section.lvl0NonAirCount = nonZeroCnt;
+        return section;
+    }
 
     private static void computeZoomCells(int[] biomes, long zoomSeed, long[] zoomInfo) {
         for (int cy = 0; cy<4; cy++) {

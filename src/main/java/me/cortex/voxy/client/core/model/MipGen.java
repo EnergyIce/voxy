@@ -68,7 +68,11 @@ public class MipGen {
         }
     }
 
-    public static void putTextures(boolean darkened, ColourDepthTextureData[] textures, MemoryBuffer into) {
+    //SCRATCH/QUEUE above are static scratch buffers reused across calls (avoids per-bake allocation),
+    // so this must be synchronized: InstanceModelBaker now calls this from the render thread while
+    // ModelFactory's own "Model factory processor" thread can call it concurrently for normal
+    // per-BlockState bakes, and unsynchronized access corrupts the shared QUEUE/SCRATCH state.
+    public static synchronized void putTextures(boolean darkened, ColourDepthTextureData[] textures, MemoryBuffer into) {
         //if (MODEL_TEXTURE_SIZE != 16) {throw new IllegalStateException("THIS METHOD MUST BE REDONE IF THIS CONST CHANGES");}
 
         //TODO: need to use a write mask to see what pixels must be used to contribute to mipping

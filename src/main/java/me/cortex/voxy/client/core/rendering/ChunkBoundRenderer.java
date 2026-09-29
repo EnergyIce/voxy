@@ -1,241 +1,225 @@
 package me.cortex.voxy.client.core.rendering;
 
-import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import me.cortex.voxy.client.core.AbstractRenderPipeline;
-import me.cortex.voxy.client.core.RenderProperties;
 import me.cortex.voxy.client.core.gl.GlBuffer;
-import me.cortex.voxy.client.core.gl.GlVertexArray;
-import me.cortex.voxy.client.core.gl.shader.AutoBindingShader;
-import me.cortex.voxy.client.core.gl.shader.Shader;
-import me.cortex.voxy.client.core.gl.shader.ShaderLoader;
-import me.cortex.voxy.client.core.gl.shader.ShaderType;
-import me.cortex.voxy.client.core.rendering.util.SharedIndexBuffer;
 import me.cortex.voxy.client.core.rendering.util.UploadStream;
-import me.cortex.voxy.common.Logger;
 import net.minecraft.client.Minecraft;
-import org.joml.Matrix4f;
-import org.joml.Vector3f;
-import org.joml.Vector3i;
+import net.minecraft.core.SectionPos;
 import org.lwjgl.system.MemoryUtil;
 
-import static org.lwjgl.opengl.ARBDirectStateAccess.glCopyNamedBufferSubData;
-import static org.lwjgl.opengl.GL11.GL_TRIANGLES;
-import static org.lwjgl.opengl.GL11.GL_UNSIGNED_BYTE;
-import static org.lwjgl.opengl.GL15.GL_ELEMENT_ARRAY_BUFFER;
-import static org.lwjgl.opengl.GL15.glBindBuffer;
-import static org.lwjgl.opengl.GL30.glBindVertexArray;
-import static org.lwjgl.opengl.GL30C.*;
-import static org.lwjgl.opengl.GL31.glDrawElementsInstanced;
-import static org.lwjgl.opengl.GL42.glDrawElementsInstancedBaseInstance;
-
-//This is a render subsystem, its very simple in what it does
-// it renders an AABB around loaded chunks, thats it
+//Tells the LoD shaders which chunk sections vanilla (sodium/embeddium) is drawing, so LoD geometry is dropped exactly
+// there and nowhere else.
+//
+// This used to rasterize the bounding boxes of all built sections into a depth buffer and drop every LoD fragment
+// closer than the farthest box along that pixel. That also dropped LoD geometry in sections vanilla does NOT draw
+// whenever a drawn section was somewhere behind it on the same pixel (unbuilt chunks along the edge of the vanilla
+// area, chunks still waiting for their neighbours), and its distance test was one block more generous than
+// embeddium's - both showed up as invisible chunks along the render distance border.
+//
+// Now every LoD fragment looks up the section it lies in, in a bitmask of built sections, and repeats sodium's own
+// render distance test for that section (same camera rounding, same search distance, same section padding).
+// Only if both say "vanilla draws this" is the fragment discarded.
 public class ChunkBoundRenderer {
-    private static final int INIT_MAX_CHUNK_COUNT = 1<<12;
-    private GlBuffer chunkPosBuffer = new GlBuffer(INIT_MAX_CHUNK_COUNT*8);//Stored as ivec2
-    private final GlBuffer uniformBuffer = new GlBuffer(128);
-    private final Long2IntOpenHashMap chunk2idx = new Long2IntOpenHashMap(INIT_MAX_CHUNK_COUNT);
-    private long[] idx2chunk = new long[INIT_MAX_CHUNK_COUNT];
-    private final Shader rasterShader;
-    private final RenderProperties properties;
+    //Header layout (per viewport, Viewport.vanillaMaskHeader), must match VanillaMaskHeader in quads.frag
+    //  ivec4 camInt  : xyz = camera block pos truncated like sodium's CameraTransform, w = masking enabled
+    //  vec4  camFrac : xyz = camera fraction like sodium's CameraTransform, w = sodium search distance in blocks
+    //  ivec4 origin  : xyz = section coords of grid cell 0, w = sodium's section padding
+    //  ivec4 size    : x = grid size on x/z, y = grid size on y
+    private static final int HEADER_SIZE = 64;
 
-    private final LongOpenHashSet addQueue = new LongOpenHashSet();
-    private final LongOpenHashSet remQueue = new LongOpenHashSet();
+    //Section padding sodium applies to a section's AABB in OcclusionCuller.isWithinRenderDistance
+    //? if 1.21.1 {
+    private static final int SODIUM_SECTION_PADDING = 1;
+    //? } else {
+    private static final int SODIUM_SECTION_PADDING = 0;
+    //? }
 
-    private final AbstractRenderPipeline pipeline;
+    //How far (in chunks) the camera may move from the grid centre before the grid is re-centred
+    private static final int RECENTER_SLACK = 4;
+
+    //Search distance (blocks) of sodium's last visibility update, captured from RenderSectionManager#getSearchDistance
+    private static volatile float sodiumSearchDistance = Float.NaN;
+
+    public static void setSodiumSearchDistance(float distance) {
+        sodiumSearchDistance = distance;
+    }
+
+    private final LongOpenHashSet sections = new LongOpenHashSet();
+
+    private GlBuffer maskBuffer = new GlBuffer(4);
+    private int[] bits = new int[0];
+    private boolean needsRebuild = true;
+    private int dirtyMin = Integer.MAX_VALUE;
+    private int dirtyMax = -1;
+
+    private int gridSize;//x/z size in sections, odd, centred on (centreX, centreZ)
+    private int centreX, centreZ;
+    private int originX, originY, originZ;
+    private int sizeY;
+
     public ChunkBoundRenderer(AbstractRenderPipeline pipeline) {
-        this.chunk2idx.defaultReturnValue(-1);
-        this.properties = pipeline.properties;
-
-        String vert = ShaderLoader.parse("voxy:chunkoutline/outline.vsh");
-        String taa = pipeline.taaFunction("getTAA");
-        if (taa != null) {
-            this.pipeline = pipeline;
-            vert = vert+"\n\n\n"+taa;
-        } else {
-            this.pipeline = null;
-        }
-
-        this.rasterShader = Shader.makeAuto()
-                .addSource(ShaderType.VERTEX, vert)
-                .defineIf("TAA", taa != null)
-                .add(ShaderType.FRAGMENT, "voxy:chunkoutline/outline.fsh")
-                .apply(this.properties::apply)
-                .compile()
-                .ubo(0, this.uniformBuffer)
-                .ssbo(1, this.chunkPosBuffer);
     }
 
     public void addSection(long pos) {
-        if (!this.remQueue.remove(pos)) {
-            this.addQueue.add(pos);
+        if (this.sections.add(pos)) {
+            this.setBit(pos, true);
         }
     }
 
     public void removeSection(long pos) {
-        if (!this.addQueue.remove(pos)) {
-            this.remQueue.add(pos);
+        if (this.sections.remove(pos)) {
+            this.setBit(pos, false);
         }
     }
 
-    //Bind and render, changing as little gl state as possible so that the caller may configure how it wants to render
-    public void render(Viewport<?> viewport) {
-        if (!this.remQueue.isEmpty()) {
-            boolean wasEmpty = this.chunk2idx.isEmpty();
-            this.remQueue.forEach(this::_remPos);//TODO: REPLACE WITH SCATTER COMPUTE
-            this.remQueue.clear();
-            if (this.chunk2idx.isEmpty()&&!wasEmpty) {//When going from stuff to nothing need to clear the depth buffer
-                viewport.depthBoundingBuffer.clear(this.properties.inverseClearDepth());
+    private void setBit(long pos, boolean value) {
+        if (this.needsRebuild) return;
+        int y = SectionPos.y(pos) - this.originY;
+        if (y < 0 || y >= this.sizeY) {
+            if (value) this.needsRebuild = true;//Grow the y range
+            return;
+        }
+        int idx = this.index(SectionPos.x(pos) - this.originX, y, SectionPos.z(pos) - this.originZ);
+        if (idx < 0) return;//Outside the grid, picked up when the grid is re-centred
+        int word = idx >>> 5;
+        if (value) {
+            this.bits[word] |= 1 << (idx & 31);
+        } else {
+            this.bits[word] &= ~(1 << (idx & 31));
+        }
+        this.dirtyMin = Math.min(this.dirtyMin, word);
+        this.dirtyMax = Math.max(this.dirtyMax, word);
+    }
+
+    private int index(int x, int y, int z) {
+        if (x < 0 || z < 0 || x >= this.gridSize || z >= this.gridSize) return -1;
+        return (x * this.gridSize + z) * this.sizeY + y;
+    }
+
+    private void rebuild(int camSecX, int camSecZ, int renderDistance) {
+        var level = Minecraft.getInstance().level;
+        int minY = Integer.MAX_VALUE;
+        int maxY = Integer.MIN_VALUE;
+        if (level != null) {
+            minY = level.getMinSection();
+            maxY = level.getMaxSection() - 1;
+        }
+        var it = this.sections.iterator();
+        while (it.hasNext()) {
+            int y = SectionPos.y(it.nextLong());
+            minY = Math.min(minY, y);
+            maxY = Math.max(maxY, y);
+        }
+        if (minY > maxY) {
+            minY = 0;
+            maxY = 0;
+        }
+
+        int half = renderDistance + 2 + RECENTER_SLACK;
+        this.gridSize = half * 2 + 1;
+        this.centreX = camSecX;
+        this.centreZ = camSecZ;
+        this.originX = camSecX - half;
+        this.originZ = camSecZ - half;
+        this.originY = minY;
+        this.sizeY = maxY - minY + 1;
+
+        int words = (int) (((long) this.gridSize * this.gridSize * this.sizeY + 31) >>> 5);
+        if (this.bits.length != words) {
+            this.bits = new int[words];
+        } else {
+            java.util.Arrays.fill(this.bits, 0);
+        }
+
+        it = this.sections.iterator();
+        while (it.hasNext()) {
+            long pos = it.nextLong();
+            int idx = this.index(SectionPos.x(pos) - this.originX, SectionPos.y(pos) - this.originY, SectionPos.z(pos) - this.originZ);
+            if (idx >= 0) {
+                this.bits[idx >>> 5] |= 1 << (idx & 31);
             }
         }
 
-        if (this.chunk2idx.isEmpty() && this.addQueue.isEmpty()) return;
-
-        viewport.depthBoundingBuffer.clear(this.properties.inverseClearDepth());
-
-        long ptr = UploadStream.INSTANCE.upload(this.uniformBuffer, 0, 128);
-        long matPtr = ptr; ptr += 4*4*4;
-
-        final float renderDistance = Minecraft.getInstance().options.getEffectiveRenderDistance()*16;//In blocks
-
-        {//This is recomputed to be in chunk section space not worldsection
-
-            //Camera block pos
-            int bx = (int)(viewport.cameraX);
-            int by = (int)(viewport.cameraY);
-            int bz = (int)(viewport.cameraZ);
-            new Vector3i(bx, by, bz).getToAddress(ptr); ptr += 4*4;
-
-            var negInnerBlock = new Vector3f(
-                    (float) (viewport.cameraX - bx),
-                    (float) (viewport.cameraY - by),
-                    (float) (viewport.cameraZ - bz));
-
-
-            negInnerBlock.getToAddress(ptr); ptr += 4*3;
-            viewport.MVP.translate(negInnerBlock.negate(), new Matrix4f()).getToAddress(matPtr);
-            MemoryUtil.memPutFloat(ptr, renderDistance); ptr += 4;
+        long needed = Math.max(words, 1) * 4L;
+        if (this.maskBuffer.size() < needed) {
+            this.maskBuffer.free();
+            this.maskBuffer = new GlBuffer(needed);
         }
+
+        this.needsRebuild = false;
+        this.dirtyMin = 0;
+        this.dirtyMax = words - 1;
+    }
+
+    //Updates the mask for this viewport; enabled=false makes the LoD shaders ignore it (nothing gets discarded)
+    public void render(Viewport<?> viewport, boolean enabled) {
+        viewport.vanillaSectionMask = this.maskBuffer;
+
+        float searchDistance = sodiumSearchDistance;
+        int optionsDistance = Minecraft.getInstance().options.getEffectiveRenderDistance();
+        if (!(searchDistance > 0)) {
+            searchDistance = optionsDistance * 16;
+        }
+        int renderDistance = Math.max(optionsDistance, (int) Math.ceil(searchDistance / 16));
+
+        int camX = (int) viewport.cameraX;//Truncated, not floored: same as sodium's CameraTransform
+        int camY = (int) viewport.cameraY;
+        int camZ = (int) viewport.cameraZ;
+
+        if (enabled) {
+            int camSecX = ((int) Math.floor(viewport.cameraX)) >> 4;
+            int camSecZ = ((int) Math.floor(viewport.cameraZ)) >> 4;
+            if (this.needsRebuild
+                    || this.gridSize != (renderDistance + 2 + RECENTER_SLACK) * 2 + 1
+                    || Math.abs(camSecX - this.centreX) > RECENTER_SLACK
+                    || Math.abs(camSecZ - this.centreZ) > RECENTER_SLACK) {
+                this.rebuild(camSecX, camSecZ, renderDistance);
+                viewport.vanillaSectionMask = this.maskBuffer;
+            }
+
+            if (this.dirtyMax >= this.dirtyMin) {
+                int count = this.dirtyMax - this.dirtyMin + 1;
+                long ptr = UploadStream.INSTANCE.upload(this.maskBuffer, this.dirtyMin * 4L, count * 4L);
+                MemoryUtil.memIntBuffer(ptr, count).put(this.bits, this.dirtyMin, count);
+                this.dirtyMin = Integer.MAX_VALUE;
+                this.dirtyMax = -1;
+            }
+        }
+
+        long ptr = UploadStream.INSTANCE.upload(viewport.vanillaMaskHeader, 0, HEADER_SIZE);
+        MemoryUtil.memPutInt(ptr, camX);
+        MemoryUtil.memPutInt(ptr + 4, camY);
+        MemoryUtil.memPutInt(ptr + 8, camZ);
+        MemoryUtil.memPutInt(ptr + 12, (enabled && !this.needsRebuild) ? 1 : 0);
+        MemoryUtil.memPutFloat(ptr + 16, sodiumFractional(viewport.cameraX));
+        MemoryUtil.memPutFloat(ptr + 20, sodiumFractional(viewport.cameraY));
+        MemoryUtil.memPutFloat(ptr + 24, sodiumFractional(viewport.cameraZ));
+        MemoryUtil.memPutFloat(ptr + 28, searchDistance);
+        MemoryUtil.memPutInt(ptr + 32, this.originX);
+        MemoryUtil.memPutInt(ptr + 36, this.originY);
+        MemoryUtil.memPutInt(ptr + 40, this.originZ);
+        MemoryUtil.memPutInt(ptr + 44, SODIUM_SECTION_PADDING);
+        MemoryUtil.memPutInt(ptr + 48, this.gridSize);
+        MemoryUtil.memPutInt(ptr + 52, this.sizeY);
+        MemoryUtil.memPutInt(ptr + 56, 0);
+        MemoryUtil.memPutInt(ptr + 60, 0);
         UploadStream.INSTANCE.commit();
-
-
-        {
-            //need to reverse the winding order since we want the back faces of the AABB, not the front
-
-            glFrontFace(GL_CW);//Reverse winding order
-
-            //"reverse depth buffer" it goes from 0->1 where 1 is far away
-            glEnable(GL_CULL_FACE);
-            glEnable(GL_DEPTH_TEST);
-            glDepthFunc(this.properties.furtherDepthCompare());
-        }
-
-        glBindVertexArray(GlVertexArray.STATIC_VAO);
-        viewport.depthBoundingBuffer.bind();
-        this.rasterShader.bind();
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, SharedIndexBuffer.INSTANCE_BB_BYTE.id());
-        if (this.pipeline != null) this.pipeline.bindUniforms();//shader TAA
-
-        //Batch the draws into groups of size 32
-        int count = this.chunk2idx.size();
-        if (count >= 32) {
-            glDrawElementsInstanced(GL_TRIANGLES, 6 * 2 * 3 * 32, GL_UNSIGNED_BYTE, 0, count/32);
-        }
-        if (count%32 != 0) {
-            glDrawElementsInstancedBaseInstance(GL_TRIANGLES, 6 * 2 * 3 * (count%32), GL_UNSIGNED_BYTE, 0, 1, (count/32)*32);
-        }
-
-        {
-            glFrontFace(GL_CCW);//Restore winding order
-
-            glDepthFunc(this.properties.closerEqualDepthCompare());
-
-            //TODO: check this is correct
-            glEnable(GL_CULL_FACE);
-            glEnable(GL_DEPTH_TEST);
-        }
-
-
-        if (!this.addQueue.isEmpty()) {
-            this.addQueue.forEach(this::_addPos);//TODO: REPLACE WITH SCATTER COMPUTE
-            this.addQueue.clear();
-            UploadStream.INSTANCE.commit();
-        }
     }
 
-    private void _remPos(long pos) {
-        int idx = this.chunk2idx.remove(pos);
-        if (idx == -1) {
-            Logger.warn("Chunk not in map: " + pos);
-            return;
-        }
-        if (idx == this.chunk2idx.size()) {
-            //Dont need to do anything as heap is already compact
-            return;
-        }
-        if (this.idx2chunk[idx] != pos) {
-            throw new IllegalStateException();
-        }
-
-        //Move last entry on heap to this index
-        long ePos = this.idx2chunk[this.chunk2idx.size()];// since is already removed size is correct end idx
-        if (this.chunk2idx.put(ePos, idx) == -1) {
-            throw new IllegalStateException();
-        }
-        this.idx2chunk[idx] = ePos;
-
-        //Put the end pos into the new idx
-        this.put(idx, ePos);
-    }
-
-    private void _addPos(long pos) {
-        if (this.chunk2idx.containsKey(pos)) {
-            Logger.warn("Chunk already in map: " + pos);
-            return;
-        }
-        this.ensureSize1();//Resize if needed
-
-        int idx = this.chunk2idx.size();
-        this.chunk2idx.put(pos, idx);
-        this.idx2chunk[idx] = pos;
-
-        this.put(idx, pos);
-    }
-
-    private void ensureSize1() {
-        if (this.chunk2idx.size() < this.idx2chunk.length) return;
-        //Commit any copies, ensures is synced to new buffer
-        UploadStream.INSTANCE.commit();
-
-        int size = (int) (this.idx2chunk.length*1.5);
-        Logger.info("Resizing chunk position buffer to: " + size);
-        //Need to resize
-        var old = this.chunkPosBuffer;
-        this.chunkPosBuffer = new GlBuffer(size * 8L);
-        glCopyNamedBufferSubData(old.id, this.chunkPosBuffer.id, 0, 0, old.size());
-        old.free();
-        var old2 = this.idx2chunk;
-        this.idx2chunk = new long[size];
-        System.arraycopy(old2, 0, this.idx2chunk, 0, old2.length);
-        //Replace the old buffer with the new one
-        ((AutoBindingShader)this.rasterShader).ssbo(1, this.chunkPosBuffer);
-    }
-
-    private void put(int idx, long pos) {
-        long ptr2 = UploadStream.INSTANCE.upload(this.chunkPosBuffer, 8L*idx, 8);
-        //Need to do it in 2 parts because ivec2 is 2 parts
-        MemoryUtil.memPutInt(ptr2, (int)(pos&0xFFFFFFFFL)); ptr2 += 4;
-        MemoryUtil.memPutInt(ptr2, (int)((pos>>>32)&0xFFFFFFFFL));
+    //Same as sodium's CameraTransform.fractional
+    private static float sodiumFractional(double value) {
+        float fullPrecision = (float) (value - (int) value);
+        float modifier = Math.copySign(128.0f, fullPrecision);
+        return (fullPrecision + modifier) - modifier;
     }
 
     public void reset() {
-        this.chunk2idx.clear();
+        this.sections.clear();
+        this.needsRebuild = true;
     }
 
     public void free() {
-        this.rasterShader.free();
-        this.uniformBuffer.free();
-        this.chunkPosBuffer.free();
+        this.maskBuffer.free();
     }
 }

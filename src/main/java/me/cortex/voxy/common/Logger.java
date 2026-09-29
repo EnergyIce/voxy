@@ -1,6 +1,5 @@
 package me.cortex.voxy.common;
 
-import me.cortex.voxy.commonImpl.VoxyCommon;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
 import org.slf4j.LoggerFactory;
@@ -50,11 +49,9 @@ public class Logger {
             }
         }
 
+        //Errors only go to the log (no action bar message on screen, the log is what's used for diagnosis)
         String error = (INSERT_CLASS?("["+callClsName()+"]: "):"") + Stream.of(args).map(Logger::objToString).collect(Collectors.joining(" "));
         LOGGER.error(error, throwable);
-        if (VoxyCommon.IS_IN_MINECRAFT && !VoxyCommon.IS_DEDICATED_SERVER) {
-            showInHUD(error);//This is done so that on dedicated server, the Minecraft client class isnt loaded
-        }
     }
 
     public static void showInHUD(String msg) {

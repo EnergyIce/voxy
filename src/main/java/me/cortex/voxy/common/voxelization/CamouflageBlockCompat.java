@@ -1,0 +1,114 @@
+package me.cortex.voxy.common.voxelization;
+
+import me.cortex.voxy.common.Logger;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.world.level.block.Block;
+
+//Detects blocks whose real appearance is stored in a BlockEntity instead of their BlockState
+// (Framed Blocks' camo, Create's Copycat "material", and the Create-addon "Copycats+"'s own
+// separate copycat implementation). Voxy bakes exactly one texture per distinct BlockState (see
+// Mapper), so these blocks would otherwise always bake using their bare/no-camo appearance -
+// which for these mods is usually empty geometry.
+//
+// This class only answers "does this block need per-instance handling" - the actual per-instance
+// baking is generic and mod-agnostic (see InstanceKeyRegistry / InstanceModelBaker): it captures
+// the real BlockEntity via the plain vanilla BlockEntity#saveWithoutMetadata() API and renders it
+// through its real BlockEntityRenderer, so it doesn't need any mod-specific "give me the material"
+// reflection at all - and it automatically keeps the block's real shape (panels/steps included),
+// since it's rendering the actual block, not swapping BlockStates.
+//
+// Detection itself still needs to know which mods to opt in to this (comparatively expensive)
+// path, resolved via reflection so this compiles and works fine without any of these mods installed.
+public class CamouflageBlockCompat {
+    private static volatile boolean initialized = false;
+
+    private static Class<?> framedBlockEntityClass;
+    private static Class<?> copycatBlockClass;
+    private static Class<?> copycatsPlusBlockClass;
+    private static Class<?> trafficCraftPaintableClass;
+    private static Class<?> trafficCraftTownSignClass;
+    private static Class<?> pawCantileverBlockClass;
+
+    private static synchronized void init() {
+        if (initialized) return;
+        initialized = true;
+
+        try {
+            framedBlockEntityClass = Class.forName("xfacthd.framedblocks.api.block.FramedBlockEntity");
+            Logger.info("Voxy: Framed Blocks instance-render compat enabled");
+        } catch (ReflectiveOperationException e) {
+            framedBlockEntityClass = null;
+            Logger.warn("Voxy: Framed Blocks instance-render compat unavailable (" + e + ")");
+        }
+
+        try {
+            copycatBlockClass = Class.forName("com.simibubi.create.content.decoration.copycat.CopycatBlock");
+            Logger.info("Voxy: Create Copycat instance-render compat enabled");
+        } catch (ReflectiveOperationException e) {
+            copycatBlockClass = null;
+            Logger.warn("Voxy: Create Copycat instance-render compat unavailable (" + e + ")");
+        }
+
+        //"Copycats+" (mod id "copycats") is a separate Create addon that adds more copycat variants
+        // (extra panel/step shapes, sliding doors, cogwheels, pipes, ...). Its blocks all implement
+        // com.copycatsplus.copycats.foundation.copycat.ICopycatBlock.
+        try {
+            copycatsPlusBlockClass = Class.forName("com.copycatsplus.copycats.foundation.copycat.ICopycatBlock");
+            Logger.info("Voxy: Copycats+ instance-render compat enabled");
+        } catch (ReflectiveOperationException e) {
+            copycatsPlusBlockClass = null;
+            Logger.warn("Voxy: Copycats+ instance-render compat unavailable (" + e + ")");
+        }
+
+        //TrafficCraft paintable blocks with a block entity: painted roads (asphalt/concrete blocks and slopes), concrete
+        // barriers, guardrails, cones, bollards, barrels, barrier fences, reflectors, traffic lights, street and house
+        // number signs, paint buckets. Their paint colour lives in the block entity and is applied through a
+        // BlockColor tint, so the plain per-BlockState bake can only produce black parts. Unpainted asphalt/concrete
+        // has no block entity and stays on the normal fast path; town signs aren't tinted and stay there too.
+        try {
+            trafficCraftPaintableClass = Class.forName("de.mrjulsen.trafficcraft.block.data.IPaintableBlock");
+            try {
+                trafficCraftTownSignClass = Class.forName("de.mrjulsen.trafficcraft.block.TownSignBlock");
+            } catch (ReflectiveOperationException e) {
+                trafficCraftTownSignClass = null;
+            }
+            Logger.info("Voxy: TrafficCraft paintable block instance-render compat enabled");
+        } catch (ReflectiveOperationException e) {
+            trafficCraftPaintableClass = null;
+        }
+
+        //Create: Pantographs and Wires cantilevers: their whole shape (width, height, offsets, insulators, registration
+        // arms, sub cantilevers) is stored in the block entity and handed to the model as DragonLib model context.
+        try {
+            pawCantileverBlockClass = Class.forName("de.mrjulsen.paw.block.abstractions.AbstractCantileverBlock");
+            Logger.info("Voxy: Create: Pantographs and Wires cantilever instance-render compat enabled");
+        } catch (ReflectiveOperationException e) {
+            pawCantileverBlockClass = null;
+        }
+    }
+
+    //Cheap pre-check usable on a bare BlockState (e.g. while scanning a section's palette),
+    // before any BlockEntity is available.
+    public static boolean mightNeedResolve(Block block) {
+        init();
+        if (copycatBlockClass != null && copycatBlockClass.isInstance(block)) {
+            return true;
+        }
+        if (copycatsPlusBlockClass != null && copycatsPlusBlockClass.isInstance(block)) {
+            return true;
+        }
+        if (trafficCraftPaintableClass != null && trafficCraftPaintableClass.isInstance(block)
+                && block instanceof net.minecraft.world.level.block.EntityBlock
+                && (trafficCraftTownSignClass == null || !trafficCraftTownSignClass.isInstance(block))) {
+            return true;
+        }
+        if (pawCantileverBlockClass != null && pawCantileverBlockClass.isInstance(block)) {
+            return true;
+        }
+        if (framedBlockEntityClass != null) {
+            var key = BuiltInRegistries.BLOCK.getKey(block);
+            return key != null && "framedblocks".equals(key.getNamespace());
+        }
+        return false;
+    }
+}

@@ -2,7 +2,6 @@ package me.cortex.voxy.client.core.rendering;
 
 import me.cortex.voxy.client.core.RenderProperties;
 import me.cortex.voxy.client.core.gl.GlBuffer;
-import me.cortex.voxy.client.core.rendering.util.DepthFramebuffer;
 import me.cortex.voxy.client.core.rendering.util.HiZBuffer;
 import net.minecraft.util.Mth;
 import org.joml.*;
@@ -12,7 +11,10 @@ import java.lang.reflect.Field;
 public abstract class Viewport <A extends Viewport<A>> {
     //public final HiZBuffer2 hiZBuffer = new HiZBuffer2();
     public final HiZBuffer hiZBuffer;
-    public final DepthFramebuffer depthBoundingBuffer = new DepthFramebuffer();
+    //Which sections vanilla draws (see ChunkBoundRenderer): per viewport header (camera, sodium distance, grid layout)
+    // and the section bitmask shared by all viewports (owned by the ChunkBoundRenderer)
+    public final GlBuffer vanillaMaskHeader = new GlBuffer(64);
+    public GlBuffer vanillaSectionMask;
 
     private static final Field planesField;
     static {
@@ -61,7 +63,7 @@ public abstract class Viewport <A extends Viewport<A>> {
 
     protected void delete0() {
         this.hiZBuffer.free();
-        this.depthBoundingBuffer.free();
+        this.vanillaMaskHeader.free();
     }
 
     public A setVanillaProjection(Matrix4fc projection) {
@@ -109,10 +111,6 @@ public abstract class Viewport <A extends Viewport<A>> {
                 (float) (this.cameraX-(sx<<5)),
                 (float) (this.cameraY-(sy<<5)),
                 (float) (this.cameraZ-(sz<<5)));
-
-        if (this.depthBoundingBuffer.resize(this.width, this.height)) {
-            this.depthBoundingBuffer.clear(this.properties.inverseClearDepth());
-        }
 
         return (A) this;
     }

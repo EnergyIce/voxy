@@ -10,6 +10,7 @@ import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.gl.Capabilities;
 import me.cortex.voxy.client.core.gl.GlBuffer;
 import me.cortex.voxy.client.core.gl.GlTexture;
+import me.cortex.voxy.client.core.model.InstanceModelBaker;
 import me.cortex.voxy.client.core.model.ModelBakerySubsystem;
 import me.cortex.voxy.client.core.model.ModelStore;
 import me.cortex.voxy.client.core.rendering.ChunkBoundRenderer;
@@ -102,8 +103,6 @@ public class VoxyRenderSystem {
         // than timeout, we keep the world acquired
         world.acquireRef();
         Logger.info("Creating Voxy render system");
-
-        System.gc();
 
         if (Minecraft.getInstance().options.renderDistance().get()<3) {
             String msg = "Voxy: Having a vanilla render distance of 2 can cause rare culling near the edge of your screen issues, please use 3 or more";
@@ -284,11 +283,7 @@ public class VoxyRenderSystem {
         this.pipeline.preSetup(viewport);
 
         TimingStatistics.E.start();
-        if ((!VoxyClient.disableSodiumChunkRender())&&!IrisUtil.irisShadowActive()) {
-            this.chunkBoundRenderer.render(viewport);
-        } else {
-            viewport.depthBoundingBuffer.clear(this.properties.inverseClearDepth());
-        }
+        this.chunkBoundRenderer.render(viewport, (!VoxyClient.disableSodiumChunkRender())&&!IrisUtil.irisShadowActive());
         TimingStatistics.E.stop();
 
 
@@ -312,6 +307,7 @@ public class VoxyRenderSystem {
             TimingStatistics.H.start();
             //Done here as is allows less gl state resetup
             do { this.modelService.tick(900_000); } while (VoxyClient.isFrexActive() && !this.modelService.areQueuesEmpty());
+            this.modelService.instanceBaker.tick(this.worldIn, InstanceModelBaker.DEFAULT_BUDGET_PER_FRAME);
             TimingStatistics.H.stop();
         }
         GPUTiming.INSTANCE.marker();

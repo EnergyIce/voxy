@@ -10,7 +10,17 @@
 #endif
 
 layout(binding = 0) uniform sampler2D blockModelAtlas;
-layout(binding = 2) uniform sampler2D depthTex;
+
+//Which chunk sections vanilla (sodium) draws, see ChunkBoundRenderer
+layout(binding = 8, std430) readonly restrict buffer VoxyVanillaMaskHeader {
+    ivec4 voxyVmCamInt;//xyz camera pos truncated like sodium, w masking enabled
+    vec4 voxyVmCamFrac;//xyz camera fraction like sodium, w sodium search distance
+    ivec4 voxyVmOrigin;//xyz section coords of grid cell 0, w sodium section padding
+    ivec4 voxyVmSize;//x grid size on x/z, y grid size on y
+};
+layout(binding = 9, std430) readonly restrict buffer VoxyVanillaMaskBits {
+    uint voxyVmBits[];
+};
 
 //#define DEBUG_RENDER
 
@@ -21,6 +31,7 @@ layout(location = 0) in flat uvec4 interData;
 #ifndef USE_NV_BARRY
 layout(location = 1) in vec2 uv;
 #endif
+layout(location = 2) in vec3 voxyMaskPos;
 
 #ifdef DEBUG_RENDER
 layout(location = 7) in flat uint quadDebug;
@@ -113,6 +124,44 @@ vec4 computeColour(vec2 texturePos, vec4 colour) {
 #endif
 
 
+//True if sodium draws the chunk section this fragment lies in: the section is built and passes sodium's
+// render distance test (OcclusionCuller.isWithinRenderDistance, same rounding and padding)
+bool isInVanillaSection() {
+    if (voxyVmCamInt.w == 0) return false;
+
+    //Sample slightly inside the block the face belongs to, so faces on a section border go to the right section
+    uint face = getFace();
+    vec3 normal = vec3(0);
+    float sgn = (face&1u)==1u?1.0:-1.0;
+    if ((face>>1)==0u) {
+        normal.y = sgn;
+    } else if ((face>>1)==1u) {
+        normal.z = sgn;
+    } else {
+        normal.x = sgn;
+    }
+    ivec3 section = (ivec3(floor(voxyMaskPos - normal*(1.0/32.0))) + (baseSectionPos<<5))>>4;
+
+    ivec3 rel = section - voxyVmOrigin.xyz;
+    if (any(lessThan(rel, ivec3(0))) || rel.x >= voxyVmSize.x || rel.z >= voxyVmSize.x || rel.y >= voxyVmSize.y) {
+        return false;
+    }
+    uint idx = uint(rel.x*voxyVmSize.x + rel.z)*uint(voxyVmSize.y) + uint(rel.y);
+    if ((voxyVmBits[idx>>5]&(1u<<(idx&31u))) == 0u) {
+        return false;
+    }
+
+    ivec3 o = (section<<4) - voxyVmCamInt.xyz;
+    ivec3 lo = o - voxyVmOrigin.w;
+    ivec3 hi = o + 16 + voxyVmOrigin.w;
+    ivec3 nearest = ivec3(0);
+    nearest = mix(nearest, lo, greaterThan(lo, ivec3(0)));
+    nearest = mix(nearest, hi, lessThan(hi, ivec3(0)));
+    vec3 d = vec3(nearest) - voxyVmCamFrac.xyz;
+    float dist = voxyVmCamFrac.w;
+    return (d.x*d.x + d.z*d.z) < (dist*dist) && abs(d.y) < dist;
+}
+
 void main() {
     //vec2 uv = vec2(0);
     //Tile is the tile we are in
@@ -156,8 +205,18 @@ void main() {
         return;
     }
 
-    //Check the minimum bounding texture and ensure we are greater than it
-    if (DEPTH_SCALAR_COMPARE(gl_FragCoord.z, texelFetch(depthTex, ivec2(gl_FragCoord.xy), 0).r)) {
+    //Single sided models: drop fragments of quads that are seen from behind (culling is disabled globally).
+    // Same front/back determination the patched shader path uses to flip the face for lighting.
+    if ((interData.x&0x80u)!=0u) {
+        uint f = getFace();
+        if ((f&1u) != uint(gl_FrontFacing != ((f>>1)!=0u))) {
+            discard;
+            return;
+        }
+    }
+
+    //Vanilla draws the chunk section this fragment lies in, drop it
+    if (isInVanillaSection()) {
         discard;
         return;
     }

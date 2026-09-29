@@ -3,7 +3,6 @@ package me.cortex.voxy.client.core.model.bakery;
 import me.cortex.voxy.client.core.model.ModelFactory;
 import net.caffeinemc.mods.sodium.api.util.ColorABGR;
 import net.caffeinemc.mods.sodium.api.util.ColorARGB;
-import net.caffeinemc.mods.sodium.api.util.ColorMixer;
 import org.joml.Matrix4f;
 import org.joml.Vector3f;
 import org.joml.Vector4f;
@@ -58,6 +57,31 @@ public class SoftwareRasterizer {
 
     public void setBlending(boolean blending) {
         this.doTheBlending = blending;
+    }
+
+    //Geometry in front of the face (outside the block on the viewer's side) is flattened onto the face instead of being
+    // dropped. Sloped models (tilted roof plates) overhang their block; clipped, the LoD staircase has a gap exactly
+    // where the neighbouring block's surface continues.
+    private boolean clampNear;
+
+    public void setClampNear(boolean clampNear) {
+        this.clampNear = clampNear;
+    }
+
+    //Tint colours (0xRRGGBB) of tint groups 1..n, indexed by group-1. A vertex metadata tint group (bits 8-15, 0 = none)
+    // multiplies the sampled texture colour with that group's colour before blending - used to bake BlockColor tints
+    // whose colour depends on per-instance data (e.g. a painted road's colour stored in its block entity).
+    private int[] tintTable;
+
+    public void setTintTable(int[] tintTable) {
+        this.tintTable = tintTable;
+    }
+
+    private static int applyTint(int abgr, int rgb) {
+        int r = ((abgr & 0xFF) * ((rgb >>> 16) & 0xFF) + 127) / 255;
+        int g = (((abgr >>> 8) & 0xFF) * ((rgb >>> 8) & 0xFF) + 127) / 255;
+        int b = (((abgr >>> 16) & 0xFF) * (rgb & 0xFF) + 127) / 255;
+        return (abgr & 0xFF000000) | (b << 16) | (g << 8) | r;
     }
 
     public void setSamplerTexture(int[] texture, int width, int height) {
@@ -164,7 +188,7 @@ public class SoftwareRasterizer {
     private void rasterPixel(int index, float b1, float b2, float b3) {//Barry coords
         float z = Math.fma(b1, this.scratchR1.z, Math.fma(b2, this.scratchR2.z, b3 * this.scratchR3.z));
         z = Math.fma(z,0.5f,0.5f);
-        if (z<0.0f && -0.000001f<=z) z = 0;//Clamp to 0 if its really small negative
+        if (z<0.0f && (this.clampNear || -0.000001f<=z)) z = 0;//Clamp to 0 if its really small negative (or clamping overhangs)
         if (z<0.0f||z>1.0f)
             return;//TODO: check this
 
@@ -175,6 +199,10 @@ public class SoftwareRasterizer {
         float v = Math.fma(b1, this.a1.z, Math.fma(b2, this.a2.z, b3 * this.a3.z));
 
         int colour = this.sampleTexture(u,v);//The ABGR colour of this pixel
+        int tintGroup = (meta >>> 8) & 0xFF;
+        if (tintGroup != 0 && this.tintTable != null && tintGroup <= this.tintTable.length) {
+            colour = applyTint(colour, this.tintTable[tintGroup - 1]);
+        }
 
 
         final int ALPHA_CUTOFF_THRESHOLD = 0;
@@ -214,6 +242,19 @@ public class SoftwareRasterizer {
     }
 
 
+    //dst*w + scr*(1-w) per RGB channel with w = alpha/255. Deliberately NOT Sodium/Embeddium's
+    // ColorMixer.mix: its third parameter is a float ratio (0..1) in Embeddium 0.3.x (1.20.1) but an
+    // int weight (0..255) in Sodium 0.6 (1.21.1), and passing the int on 1.20.1 silently widens 255 to
+    // 255.0f, overflowing the maths into random per-pixel colours whenever translucent pixels were
+    // blended over already-rasterised ones (e.g. glass beside/over bricks in one model).
+    private static int mixRGB(int a, int b, int alpha) {
+        int wA = alpha + (alpha >>> 7);//0..255 -> 0..256 so full alpha is exactly a
+        int wB = 256 - wA;
+        int rb = (((a & 0x00FF00FF) * wA + (b & 0x00FF00FF) * wB) >>> 8) & 0x00FF00FF;
+        int g = (((a & 0x0000FF00) * wA + (b & 0x0000FF00) * wB) >>> 8) & 0x0000FF00;
+        return rb | g;
+    }
+
     // ARBDrawBuffersBlend.glBlendFuncSeparateiARB(0, GL_ONE_MINUS_DST_ALPHA, GL_DST_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
     private static int doBlending(int scr, int dst) {
         int srcAlpha = (scr>>>24)&0xFF;
@@ -226,7 +267,7 @@ public class SoftwareRasterizer {
         int blendAlpha = Math.min(0xFF,srcAlpha+((dstAlpha*(255-srcAlpha))>>8));
         //how much did we actually get
 
-        int blend = ColorMixer.mix(dst, scr, dstAlpha);//addRGB(ColorABGR.mulRGB(scr, 255-dstAlpha),ColorABGR.mulRGB(dst, dstAlpha));
+        int blend = mixRGB(dst, scr, dstAlpha);
         return blend|(blendAlpha<<24);
     }
 

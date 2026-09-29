@@ -125,7 +125,12 @@ public final class ReuseVertexConsumer implements VertexConsumer {
     }
 
     public ReuseVertexConsumer quad(BakedQuad quad, boolean forceSolid, RenderType layer) {
-        int meta = 0;
+        return this.quad(quad, forceSolid, layer, 0);
+    }
+
+    //extraMeta is OR-ed into the per-vertex metadata; bits 8-15 carry a tint group (see SoftwareRasterizer#setTintTable)
+    public ReuseVertexConsumer quad(BakedQuad quad, boolean forceSolid, RenderType layer, int extraMeta) {
+        int meta = extraMeta;
         meta |= forceSolid?0:(layer!=RenderType.solid()?1:0);//has discard
         meta |= quad.isTinted()?4:0;//has tinting
         return this.quad(quad, meta);

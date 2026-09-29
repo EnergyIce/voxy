@@ -4,6 +4,7 @@ package me.cortex.voxy.client.core.model;
 import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
 import me.cortex.voxy.client.VoxyClient;
 import me.cortex.voxy.common.Logger;
+import me.cortex.voxy.common.world.WorldEngine;
 import me.cortex.voxy.common.world.other.Mapper;
 import java.util.List;
 import java.util.concurrent.ConcurrentLinkedDeque;
@@ -17,6 +18,7 @@ public class ModelBakerySubsystem {
 
     private final ModelStore storage = new ModelStore();
     public final ModelFactory factory;
+    public final InstanceModelBaker instanceBaker;
     private final Mapper mapper;
 
     private final Thread processingThread;
@@ -25,6 +27,7 @@ public class ModelBakerySubsystem {
     public ModelBakerySubsystem(Mapper mapper) {
         this.mapper = mapper;
         this.factory = new ModelFactory(mapper, this.storage);
+        this.instanceBaker = new InstanceModelBaker(this.factory);
         this.processingThread = new Thread(()->{//TODO replace this with something good/integrate it into the async processor so that we just have less threads overall
             while (this.isRunning) {
                 while (this.factory.processAllThings());
@@ -60,6 +63,7 @@ public class ModelBakerySubsystem {
 
         this.factory.free();
         this.storage.free();
+        this.instanceBaker.free();
     }
 
     //This is on this side only and done like this as only worker threads call this code

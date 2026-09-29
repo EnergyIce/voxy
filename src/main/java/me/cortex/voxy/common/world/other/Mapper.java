@@ -45,6 +45,9 @@ import java.util.function.Consumer;
 public class Mapper {
     private static final int BLOCK_STATE_TYPE = 1;
     private static final int BIOME_TYPE = 2;
+    //Persisted camouflage/mimicry instance keys (see InstanceKeyRegistry), stored in the same id-mapping
+    // storage but owned by the registry, not by this class's own state/biome tables.
+    private static final int INSTANCE_TYPE = 3;
 
     private final IMappingStorage storage;
     public static final long UNKNOWN_MAPPING = -1;
@@ -101,6 +104,72 @@ public class Mapper {
         return Integer.toUnsignedLong(light&0xFF)<<56;
     }
 
+    //Bits 0-26 of the packed voxel id are otherwise completely unused (block id starts at bit 27).
+    //Used to point a voxel at a per-instance baked model (e.g. a camouflage/mimicry block's real,
+    //resolved appearance - see CamouflageBlockCompat/InstanceModelBaker) instead of the shared
+    //per-BlockState one that "block id" normally resolves to. The block id keeps pointing at the
+    //wrapper's own BlockState so shape/geometry stays correct - only the sampled texture changes.
+    //Bit 26 is the "has instance override" flag, bits 0-25 are the instance registry index.
+    private static final long INSTANCE_FLAG_BIT = 1L<<26;
+    private static final long INSTANCE_INDEX_MASK = (1L<<26)-1;
+
+    public static boolean hasInstanceOverride(long id) {
+        return (id & INSTANCE_FLAG_BIT) != 0;
+    }
+
+    public static int getInstanceIndex(long id) {
+        return (int) (id & INSTANCE_INDEX_MASK);
+    }
+
+    public static long withInstanceOverride(long id, int instanceIndex) {
+        if ((instanceIndex & ~INSTANCE_INDEX_MASK) != 0) {
+            throw new IllegalArgumentException("Instance index out of range: " + instanceIndex);
+        }
+        return (id & ~(INSTANCE_FLAG_BIT|INSTANCE_INDEX_MASK)) | INSTANCE_FLAG_BIT | Integer.toUnsignedLong(instanceIndex);
+    }
+
+    //Persistence for InstanceKeyRegistry: camouflage/mimicry block instances (wrapper BlockState + the
+    // block entity's NBT) are referenced by index from stored voxel data, so the index -> key table
+    // has to survive restarts or every previously ingested camo voxel would fall back to the bare block.
+    public record InstanceEntry(int index, BlockState state, CompoundTag nbt) {}
+
+    public void persistInstanceEntry(int index, BlockState state, CompoundTag nbt) {
+        try {
+            var serialized = new CompoundTag();
+            serialized.putInt("id", index);
+            serialized.put("block_state", BlockState.CODEC.encodeStart(NbtOps.INSTANCE, state).result().get());
+            serialized.put("be", nbt);
+            var out = new ByteArrayOutputStream();
+            NbtIo.writeCompressed(serialized, out);
+            byte[] bytes = out.toByteArray();
+            ByteBuffer buffer = MemoryUtil.memAlloc(bytes.length);
+            buffer.put(bytes);
+            buffer.rewind();
+            this.storage.putIdMapping(index | (INSTANCE_TYPE<<30), buffer);
+            MemoryUtil.memFree(buffer);
+        } catch (Exception e) {
+            Logger.error("Voxy: failed to persist camouflage instance " + index, e);
+        }
+    }
+
+    public List<InstanceEntry> loadInstanceEntries() {
+        List<InstanceEntry> out = new ArrayList<>();
+        for (var entry : this.storage.getIdMappingsData().int2ObjectEntrySet()) {
+            if ((entry.getIntKey()>>>30) != INSTANCE_TYPE) continue;
+            int id = entry.getIntKey() & ((1<<30)-1);
+            try {
+                byte[] data = entry.getValue();
+                var compound = NbtIo.readCompressed(new ByteArrayInputStream(data), NbtAccounter.unlimitedHeap());
+                var state = BlockState.CODEC.parse(NbtOps.INSTANCE, compound.getCompound("block_state")).result();
+                if (state.isEmpty() || state.get().isAir()) continue;
+                out.add(new InstanceEntry(id, state.get(), compound.getCompound("be")));
+            } catch (Exception e) {
+                Logger.error("Voxy: failed to load camouflage instance " + id + ", it will fall back to the plain block", e);
+            }
+        }
+        return out;
+    }
+
     public void setStateCallback(Consumer<StateEntry> stateCallback) {
         this.newStateCallback = stateCallback;
     }
@@ -142,6 +211,8 @@ public class Mapper {
                 if (this.biome2biomeEntry.put(bentry.biome, bentry) != null) {
                     throw new IllegalStateException("Multiple mappings for biome entry");
                 }
+            } else if (entryType == INSTANCE_TYPE) {
+                continue;//Owned by InstanceKeyRegistry, see loadInstanceEntries()
             } else {
                 throw new IllegalStateException("Unknown entryType");
             }

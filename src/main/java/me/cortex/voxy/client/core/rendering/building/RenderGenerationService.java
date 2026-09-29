@@ -1,9 +1,11 @@
 package me.cortex.voxy.client.core.rendering.building;
 
+import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import me.cortex.voxy.client.core.model.IdNotYetComputedException;
 import me.cortex.voxy.client.core.model.ModelBakerySubsystem;
+import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.thread.Service;
 import me.cortex.voxy.common.thread.ServiceManager;
 import me.cortex.voxy.common.util.Pair;
@@ -11,6 +13,7 @@ import me.cortex.voxy.common.world.WorldEngine;
 import me.cortex.voxy.common.world.WorldSection;
 import me.cortex.voxy.common.world.other.Mapper;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -61,6 +64,14 @@ public class RenderGenerationService {
 
     private final Service service;
 
+    //Tasks of sections that contain a camouflage instance which is still baking, by instance index. They are not
+    // retried until that instance is baked (InstanceModelBaker calls onInstanceResolved): retrying them right away
+    // kept the (often single) mesh worker busy re-meshing the same waiting sections over and over while thousands
+    // of instances were baking, so the rest of the LoDs didn't load. Parked tasks stay in taskMap but hold no section.
+    private final Object parkLock = new Object();
+    private final Int2ObjectOpenHashMap<ArrayList<BuildTask>> parked = new Int2ObjectOpenHashMap<>();
+    private int parkedCount;
+
 
     /*
     public RenderGenerationService(WorldEngine world, ModelBakerySubsystem modelBakery, ServiceManager sm, boolean emitMeshlets) {
@@ -74,12 +85,41 @@ public class RenderGenerationService {
 
         this.service = sm.createService(()->{
             //Thread local instance of the factory
-            var factory = new RenderDataFactory(this.world, this.modelBakery.factory, this.emitMeshlets);
+            var factory = new RenderDataFactory(this.world, this.modelBakery.factory, this.modelBakery.instanceBaker, this.emitMeshlets);
             IntOpenHashSet seenMissed = new IntOpenHashSet(128);
             return new Pair<>(() -> {
                 this.processJob(factory, seenMissed);
             }, factory::free);
         }, 10, "Section mesh generation service");
+        this.modelBakery.instanceBaker.setResolveListener(this::onInstanceResolved);
+    }
+
+    private void park(BuildTask task, int instanceIndex) {
+        synchronized (this.parkLock) {
+            this.parked.computeIfAbsent(instanceIndex, k -> new ArrayList<>()).add(task);
+            this.parkedCount++;
+        }
+        //The bake may have finished between the mesh attempt and parking - its notification found nothing then
+        if (!this.modelBakery.instanceBaker.isPending(instanceIndex)) {
+            this.onInstanceResolved(instanceIndex);
+        }
+    }
+
+    private void onInstanceResolved(int instanceIndex) {
+        ArrayList<BuildTask> tasks;
+        synchronized (this.parkLock) {
+            tasks = this.parked.remove(instanceIndex);
+            if (tasks == null) return;
+            this.parkedCount -= tasks.size();
+        }
+        for (var task : tasks) {
+            task.updatePriority();
+            this.taskQueue.add(task);
+            this.taskQueueCount.incrementAndGet();
+            if (this.service.isLive()) {
+                this.service.execute();
+            }
+        }
     }
 
     public void setResultConsumer(Consumer<BuiltSection> consumer) {
@@ -164,7 +204,29 @@ public class RenderGenerationService {
 
         try {
             mesh = factory.generateMesh(section);
-        } catch (IdNotYetComputedException e) {
+        } catch (Exception genericException) {
+            //Guard against ANY unexpected exception (not just the expected-and-handled
+            // IdNotYetComputedException below) leaking this WorldSection forever. This used to fall
+            // straight through to the method's end without running the shouldFreeSection/release()
+            // block below, permanently leaking the section's "active" state - with e.g. exactly 2
+            // such crashes (a concurrent-map corruption bug in InstanceModelBaker, since fixed)
+            // pinning ActiveSectionTracker's loaded-cache count at 2 forever and hanging
+            // VoxyInstance#shutdown()'s wait loop on every subsequent disconnect/kick. Dropping this
+            // one job and releasing the section is a normal, recoverable failure - it'll simply be
+            // regenerated next time this section is touched - instead of wedging the whole world.
+            if (!(genericException instanceof IdNotYetComputedException)) {
+                Logger.error("Voxy: unexpected exception while generating mesh for section, dropping this job and releasing the section", genericException);
+                //Mirror the exact bookkeeping the normal-completion path below does, so
+                // holdingSectionCount (which bounds MAX_HOLDING_SECTION_COUNT) stays accurate.
+                if (shouldFreeSection) {
+                    if (task != null && task.section != null) {
+                        this.holdingSectionCount.decrementAndGet();
+                    }
+                    section.release();
+                }
+                return;
+            }
+            var e = (IdNotYetComputedException) genericException;
             {
                 long stamp = this.taskMapLock.writeLock();
                 BuildTask other = this.taskMap.putIfAbsent(task.position, task);
@@ -194,6 +256,16 @@ public class RenderGenerationService {
                     shouldFreeSection = true;
                     task = null;
                 }
+            }
+            if (task != null && !e.isIdBlockId) {
+                //Waiting for a camouflage instance bake: park until it's done, without holding the section
+                if (task.section != null) {
+                    this.holdingSectionCount.decrementAndGet();
+                    task.section = null;
+                }
+                shouldFreeSection = true;
+                this.park(task, e.id);
+                task = null;
             }
             if (task != null) {
                 //This is our task
@@ -327,6 +399,23 @@ public class RenderGenerationService {
 
         //Shutdown the threads
         this.service.shutdown();
+        this.modelBakery.instanceBaker.setResolveListener(null);
+
+        //Drop parked tasks (they hold no section)
+        synchronized (this.parkLock) {
+            long stamp = this.taskMapLock.writeLock();
+            for (var tasks : this.parked.values()) {
+                for (var task : tasks) {
+                    if (this.taskMap.remove(task.position) != task) {
+                        this.taskMapLock.unlockWrite(stamp);
+                        throw new IllegalStateException();
+                    }
+                }
+            }
+            this.taskMapLock.unlockWrite(stamp);
+            this.parked.clear();
+            this.parkedCount = 0;
+        }
 
         //Cleanup any remaining data
         while (!this.taskQueue.isEmpty()) {
@@ -354,7 +443,11 @@ public class RenderGenerationService {
             MESH_FAILED_COUNTER.set(0);
             this.lastChangedTime = System.currentTimeMillis();
         }
-        debug.add("RSSQ/TFC: " + this.taskQueueCount.get() + "/" + MESH_FAILED_COUNTER.get());//render section service queue, Task Fail Counter
+        int parked;
+        synchronized (this.parkLock) {
+            parked = this.parkedCount;
+        }
+        debug.add("RSSQ/TFC/P: " + this.taskQueueCount.get() + "/" + MESH_FAILED_COUNTER.get() + "/" + parked);//render section service queue, Task Fail Counter, parked (waiting for instance bakes)
 
     }
 
