@@ -47,10 +47,11 @@ You do **not** need to install Gradle - the included Gradle wrapper (`gradlew` /
 ```bash
 git clone https://github.com/EnergyIce/voxy.git
 cd voxy
-git checkout fix/framedblocks-create-copycat-compat
 ```
 
-(Or download the branch as a ZIP from GitHub and extract it.)
+This checks out the default branch `rework/modded-block-lods`, which contains the rework.
+
+(Or on the GitHub page click **Code → Download ZIP** and extract it.)
 
 ### 2. Build
 
